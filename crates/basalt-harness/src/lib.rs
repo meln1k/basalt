@@ -1,5 +1,6 @@
 //! Workloads, test specs, the seed runner and sweep, checkers, and swarm configs.
 
+pub mod checker;
 pub mod panic_hook;
 
 /// The commit this build came from, with `-dirty` if its sources differed from it, or `unknown`

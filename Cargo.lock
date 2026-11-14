@@ -77,6 +77,9 @@ dependencies = [
 [[package]]
 name = "basalt-harness"
 version = "0.1.0"
+dependencies = [
+ "basalt-env",
+]
 
 [[package]]
 name = "basalt-rt"
