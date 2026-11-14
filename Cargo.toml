@@ -8,3 +8,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/meln1k/basalt"
 publish = false
+
+# A panic anywhere fails a simulation run and stops a server; the supervisor restarts it.
+[profile.release]
+panic = "abort"
