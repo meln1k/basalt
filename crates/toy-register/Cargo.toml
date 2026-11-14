@@ -1,0 +1,9 @@
+[package]
+name = "toy-register"
+description = "The milestone 1 system under test: an ABD replicated register."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+

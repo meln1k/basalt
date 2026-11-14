@@ -1,0 +1,9 @@
+[package]
+name = "basalt-sim"
+description = "The simulated world: executor, virtual time, network, disks, machines and processes, and fault control."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+

@@ -1,0 +1,12 @@
+# A crate of deliberate determinism violations. ci/lint-canary.sh fails unless clippy rejects
+# every one, using the repository's clippy.toml. Not a workspace member, so normal builds skip it.
+[package]
+name = "lint-canary"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+basalt-env = { path = "../../crates/basalt-env" }
+
+[workspace]

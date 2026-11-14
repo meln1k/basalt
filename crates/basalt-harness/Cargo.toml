@@ -1,0 +1,9 @@
+[package]
+name = "basalt-harness"
+description = "Workloads, test specs, the seed runner and sweep, checkers, and swarm configs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+

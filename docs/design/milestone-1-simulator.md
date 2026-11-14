@@ -1,6 +1,6 @@
 # Milestone 1: simulator design
 
-Status: draft. Last updated 2026-11-13.
+Status: draft. Last updated 2026-11-14.
 
 Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code runs as plain Rust futures on our own single-threaded executor, built on `async-task`, and reaches time, randomness, network, and disks only through one context type, `Ctx`, passed explicitly. Diagnostics (`buggify!`, `probe!`, `trace!`, and knobs) are ambient, because they never depend on which process is acting. In tests, a simulated world implements `Ctx`. In production, a thin real-I/O backend implements it. We prove the simulator by finding two planted bugs in a toy replicated register and replaying each failure exactly from its seed. The shipped `basalt` binary includes the simulator from day one, so `basalt sim` runs against the exact build that gets deployed.
 
@@ -17,6 +17,7 @@ Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code 
 | Core code is `Send`? | No | `Rc` and `RefCell` are allowed, with no locks in core code. |
 | Context | Explicit `Ctx` for capabilities, an ambient world for diagnostics | Process identity can't go wrong, and fault points in leaf code need no plumbing. |
 | Where the simulator ships | Inside the `basalt` binary, as `basalt sim` | The build that is tested is the build that is deployed, and users can run simulation on their own hardware. |
+| hyper | Not in milestone 1. In milestone 2 it moves to an HTTP crate, behind a small newtype over `Stream` that implements hyper's `rt::Read`/`rt::Write`. HTTP/1 only, with no hyper `Timer` or `Executor`, and `auto_date_header(false)` with the `Date` header set from `ctx.wall_clock()`. | `basalt-env` stays free of hyper and of the `tokio` it pulls in, so `cargo-deny` can ban `tokio` outright. hyper's own `Date` header reads the real clock, which would break determinism. |
 
 ## Core code reaches the world only through `basalt-env`
 
@@ -24,7 +25,7 @@ Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code 
 
 | Crate | Role | May depend on |
 | --- | --- | --- |
-| `basalt-env` | The `Ctx` type, the ambient world behind `buggify!`, `probe!`, `trace!`, and knobs, time and address types, I/O errors, deterministic collections | `async-task`, `futures-io`, `hyper` (traits only) |
+| `basalt-env` | The `Ctx` type, the ambient world behind `buggify!`, `probe!`, `trace!`, and knobs, time and address types, I/O errors, deterministic collections | `async-task`, `futures-io` |
 | `basalt-sim` | The simulated world: executor, virtual time, network, disks, machines and processes, and the fault control API | `basalt-env` |
 | `basalt-rt` | The production backend: the executor loop, the `async-io` reactor, a file I/O pool, and a compute pool | `basalt-env`, `async-io` |
 | `basalt-harness` | The workload trait, test specs, the seed runner and sweep CLI, the linearizability checker, swarm configs | `basalt-env`, `basalt-sim` |
@@ -50,7 +51,7 @@ impl Ctx {
     pub fn now(&self) -> Instant;              // monotonic; virtual in simulation
     pub fn wall_clock(&self) -> SystemTime;    // per machine; skew and jumps in simulation
     pub fn sleep(&self, d: Duration) -> Sleep;
-    pub fn timeout<F: Future>(&self, d: Duration, f: F) -> Timeout<F>;
+    pub fn timeout<F: Future>(&self, d: Duration, f: F) -> impl Future<Output = Result<F::Output, Elapsed>>;
 
     // Randomness
     pub fn rng(&self) -> &Rng;                 // u64, ranges, bool(p), shuffle
@@ -60,7 +61,7 @@ impl Ctx {
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Stream>;
 
     // Disks
-    pub fn disks(&self) -> &[DiskId];
+    pub fn disks(&self) -> Rc<[DiskId]>;
     pub fn disk(&self, id: DiskId) -> Disk;
 
     // CPU-heavy work (erasure coding, checksums later)
@@ -69,9 +70,9 @@ impl Ctx {
 ```
 
 - **`Task<T>`** wraps `async_task::Task`. Dropping it cancels the future. `detach()` hands the task to its process's task set instead of leaking it, so killing a process still drops it.
-- **`Stream`** implements `futures-io` `AsyncRead`/`AsyncWrite` and hyper's `rt::Read`/`rt::Write`. `Ctx` implements hyper's `Executor` and `Timer`. In milestone 2, simulated S3 clients can then speak real HTTP to simulated nodes.
+- **`Stream`** implements `futures-io` `AsyncRead`/`AsyncWrite` and nothing else. Protocols such as HTTP are layered on top of it in their own crates, so `basalt-env` stays free of protocol dependencies.
 - **Disk I/O takes owned buffers** (`write_at(buf: Vec<u8>, offset) -> (io::Result<()>, Vec<u8>)`), so moving to io_uring later doesn't change the API.
-- **`compute`** runs inline in simulation and charges `cost` in virtual time. In production it runs on a thread pool, the only place where `Send` is required.
+- **`compute`** runs inline in simulation, with the ambient world suspended so the job sees what a production pool thread sees, and charges `cost` in virtual time. In production it runs on a thread pool, the only place where `Send` is required.
 
 ```rust
 impl Disk {
@@ -98,17 +99,18 @@ Each thread has at most one world, so diagnostics can find it without knowing th
 ```rust
 // basalt-env: the whole ambient API. Nothing process-scoped may be added here.
 buggify!()                      // -> bool
+buggify!(0.01)                  // -> bool, fires with this probability when switched on
 probe!("raft.vote_after_lost_log")
 trace!(Info, "ReplicaWrite", ts = ts, bytes = len)
 knobs()                         // -> Rc<Knobs>
 is_simulated()                  // -> bool
 ```
 
-|  | Simulated world | Production world | No world (unit tests, compute pool threads) |
+|  | Simulated world | Production world | No world (unit tests, `compute` jobs) |
 | --- | --- | --- | --- |
-| `buggify!()` | Per-site switch drawn from the seeded PRNG | `false` | `false` |
+| `buggify!()`, `buggify!(p)` | Per-site switch drawn from the seeded BUGGIFY stream | `false` | `false` |
 | `probe!` | Counts hits for the sweep's coverage report | Counter for metrics | No-op |
-| `trace!` | Recorded with virtual time; part of the unseed hash | Written to the log | No-op |
+| `trace!` | Recorded with virtual time; part of the unseed hash. An `Error` event fails the run | Written to the log | No-op |
 | `knobs()` | Defaults, some randomized per seed | Defaults plus config | Defaults |
 
 - **Trace events carry a process label** taken from the task being polled, when there is one. The label is only for reading traces; no behavior depends on it, so a wrong label during a kill misleads a reader but can't break a run.
@@ -134,12 +136,13 @@ loop:
 - **Priorities** are a small enum: `Coordination`, `Replication`, `Default`, `Background`.
 - **`Sleep` and `delay`** sometimes get extra random delay when BUGGIFY is on, as in FoundationDB.
 - **The `schedule` callback asserts it runs on the simulator thread.** `async-task` wakers are `Send`, so a dependency waking a task from another thread would break determinism. The assertion catches it.
+- **An `Error` trace fails the run**, as in FoundationDB. `Error` is for things that must never happen, so every error trace is an assertion the sweep checks; faults the system is built to survive use `Warn`.
 - **A panic in any task fails the run.** The binary is built with `panic = "abort"` for both subcommands. A panic hook first prints the seed and commit hash when a simulated world is installed, then the process aborts. In production, the supervisor restarts it.
 - **Simulation runs the release build**, so invariant checks inside core code use `assert!`, not `debug_assert!`. Checks too expensive for production go behind `is_simulated()`.
 
 ### Machines, processes, and kills
 
-Machines carry a failure zone and a set of disks. Each process runs an entry point `fn(Ctx) -> LocalBoxFuture<'static, ()>` and owns its task set. A kill bumps the process's generation and drops the task set: every future of that process is dropped, and stale runnables are discarded when they come up. A reboot reruns the entry point against the same disks.
+Machines carry a failure zone and a set of disks. Each process runs an entry point `fn(Ctx) -> LocalBoxFuture<'static, ()>` and owns its task set. A kill wakes every task of the process and drops them all before any other task runs, so every future of that process is dropped, including tasks parked forever and tasks whose handle another process holds; stale runnables are discarded when they come up. A reboot reruns the entry point against the same disks as a new incarnation with a fresh `ProcessId`. Ids are never reused, so a `Ctx` kept from before the kill stays dead: tasks it spawns are dropped unpolled, and its I/O fails.
 
 | Kill type | Unsynced writes | Use |
 | --- | --- | --- |
@@ -169,14 +172,16 @@ The monotonic clock is shared virtual time, with an optional drift rate per mach
 
 ## Randomness comes from one seed and is checked at the end
 
-- The world owns one PRNG seeded from the run's seed. Every draw comes from it: latencies, faults, BUGGIFY, shuffles, and `ctx.rng()`.
+- Every draw comes from the run's seed, split into named streams: `Rng::derive(seed, "network")`. The simulator keeps one stream each for scheduling, the network, disks, faults and the swarm config, BUGGIFY, and `ctx.rng()`. With a single stream, one extra draw anywhere shifts every later draw, so flipping a planted bug's flag would also change which faults hit and when. With separate streams, the bug-on and bug-off runs of a seed see the same faults, as long as the fault workloads don't react to what the system under test does. Streams are named, not numbered, so adding one never shifts the others.
+- Core code still sees one generator, `ctx.rng()`. `Rng::fork()` splits off an owned generator, for example to move into a `compute` job. Processes don't get their own streams: they affect each other through messages and scheduling anyway.
 - The PRNG is our own xoshiro256** (about 20 lines), not the `rand` crate, so its output never changes with a dependency upgrade.
-- **The unseed:** at the end of a run, the harness prints a hash of the PRNG state and of the trace events. Running the same seed again must print the same value, or the run is nondeterministic. CI runs a sample of seeds twice.
+- **The unseed:** at the end of a run, the harness prints a hash of every stream's state and of the trace events. Running the same seed again must print the same value, or the run is nondeterministic. CI runs a sample of seeds twice.
 - A failing seed reproduces on the same commit. The harness prints the seed together with the commit hash.
 
 ## BUGGIFY, knobs, and probes work from any code
 
 - `buggify!()` is a per-site switch. A site is switched on for the whole run with probability 0.25 and then fires with probability 0.25, as in FoundationDB's `Buggify.h`. It is `false` in production.
+- `buggify!(p)` fires a switched-on site with probability `p` instead, like FoundationDB's `BUGGIFY_WITH_PROB`. It is for faults that would stall a run if they fired a quarter of the time, such as resetting every connection.
 - `Knobs` holds every tuning constant (timeouts, batch sizes, retry intervals). In simulation, each knob may be randomized within its declared range.
 - `probe!("name")` counts how often a rare path is reached. The sweep reports probes that no seed hit, so we know when a test stops exercising what it claims to.
 - **Swarm testing:** each seed enables a random subset of fault types and knob randomizations, so rare combinations get explored.
@@ -202,6 +207,7 @@ trait Workload {
 - A linearizability checker in the style of Porcupine (Wing and Gong search, split per key), run on histories recorded with invocation and response times.
 - A durability checker: no acknowledged write is lost.
 - The hang detector from the run loop.
+- Any `Error` trace event during the run.
 
 **Runner CLI:**
 
@@ -216,8 +222,8 @@ A sweep starts `-j` child processes of the same binary, each running seeds one a
 
 ## Enforcing determinism
 
-- `clippy.toml` `disallowed-methods` and `disallowed-types` in every crate except the two backends: `std::time::{Instant, SystemTime}::now`, `std::thread::spawn`, `std::fs`, `std::net`, `std::collections::HashMap` and `HashSet` with the default hasher (`basalt-env` provides versions with a fixed hasher), `rand::thread_rng`, and all of `tokio`. `disallowed-macros` bans `thread_local!` outside `basalt-env` and the backends, so the ambient world stays the only ambient state.
-- `cargo-deny` bans `tokio` and other runtimes from the dependency graph.
+- `clippy.toml` `disallowed-methods` and `disallowed-types` in every crate except the two backends: `std::time::{Instant, SystemTime}::{now, elapsed}` and other waits on the real clock, `std::thread::spawn`, `std::fs`, `std::net` and Unix sockets, `std::env::var`, `std::process::Command`, `std::collections::HashMap` and `HashSet` with the default hasher (`basalt-env` provides versions with a fixed hasher), `rand::thread_rng`, and all of `tokio`. `disallowed-macros` bans `thread_local!` outside `basalt-env` and the backends, so the ambient world stays the only ambient state.
+- `cargo-deny` bans `tokio` and other runtimes from the dependency graph, and allows reactor crates (`async-io`, `polling`, `futures-lite`) only under `basalt-rt`.
 - The unseed check catches what the lints miss.
 
 ## The toy register proves the simulator finds real bugs
@@ -274,7 +280,7 @@ The demo: a sweep with a bug on finds a failing seed, `run --seed N` replays the
 - **Fully ambient context, as in FoundationDB:** the most ergonomic, but the current process is only right inside a poll. Code running in a `Drop` during a kill, in a waker, or in workload code acts under the wrong identity, and a misattributed task survives its owner's kill. FoundationDB's `ASSERT(currentProcess == t.machine)` and `onProcess()` hops exist for this.
 - **Fully explicit context:** safe, but every fault point and trace event in leaf code would need `ctx` threaded through all its callers, which discourages adding them.
 - **A separate `basalt-sim` binary:** smaller release builds, but simulation would test a different build from the one deployed, and users couldn't check their own build on their own hardware.
-- **Message-level network simulation:** faster, but hyper and rustls need byte streams, and stream-level faults are what production sees.
+- **Message-level network simulation:** faster, but production runs over TCP byte streams: framing, partial reads and writes, and connection resets are what real code must handle, and stream-level faults are what production sees. Protocol libraries layered on later, such as HTTP and TLS, also expect byte streams.
 
 ## Risks
 
@@ -290,4 +296,4 @@ The demo: a sweep with a bug on finds a failing seed, `run --seed N` replays the
 
 ## Out of scope for milestone 1
 
-Raft, the S3 API, HTTP and TLS running under simulation (the traits are designed for it), io_uring, multiple shards in `basalt-rt`, shrinking failing runs, TOML test specs, and running sweeps across several machines.
+Raft, the S3 API, HTTP and TLS running under simulation (both can be layered on `Stream` later), io_uring, multiple shards in `basalt-rt`, shrinking failing runs, TOML test specs, and running sweeps across several machines.

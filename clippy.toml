@@ -1,0 +1,102 @@
+# Determinism lints. Core code reaches time, threads, files, sockets, and randomness only through
+# `basalt_env::Ctx`, so the simulator can run it deterministically from a seed.
+#
+# These apply to every crate. The exemptions are `#![allow(...)]`s, and only in:
+# - basalt-rt, the production backend, which reaches the real world (all three lints, crate-wide);
+# - basalt-sim, which installs the ambient world (`thread_local!` only, crate-wide);
+# - basalt-env, which holds the ambient world (`thread_local!`, crate-wide, because clippy honors
+#   that allow only at the crate root) and wraps the std collections (item by item).
+# ci/lint-canary.sh checks that these lints still fire in core code.
+
+disallowed-methods = [
+    # Clocks: use ctx.now() and ctx.wall_clock().
+    { path = "std::time::Instant::now", reason = "use ctx.now(): real clocks break determinism" },
+    { path = "std::time::SystemTime::now", reason = "use ctx.wall_clock(): real clocks break determinism" },
+    # `elapsed` reads the real clock too, even on a SystemTime from ctx.wall_clock().
+    { path = "std::time::SystemTime::elapsed", reason = "reads the real clock; use ctx.wall_clock().duration_since(earlier)" },
+    { path = "std::time::Instant::elapsed", reason = "reads the real clock; use ctx.now() - earlier" },
+    # Blocking with a timeout waits on the real clock.
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "waits on the real clock; use ctx.timeout()" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "waits on the real clock; use ctx.timeout()" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "waits on the real clock; use ctx.timeout()" },
+    { path = "std::thread::park_timeout", reason = "waits on the real clock; use ctx.timeout()" },
+    { path = "std::thread::sleep", reason = "use ctx.sleep(): blocking on real time stalls every process" },
+
+    # Threads: use ctx.spawn(), or ctx.compute() for CPU-heavy work.
+    { path = "std::thread::spawn", reason = "use ctx.spawn() or ctx.compute(): threads break determinism" },
+    { path = "std::thread::scope", reason = "use ctx.spawn() or ctx.compute(): threads break determinism" },
+    { path = "std::thread::Builder::spawn", reason = "use ctx.spawn() or ctx.compute(): threads break determinism" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "use ctx.spawn() or ctx.compute(): threads break determinism" },
+    { path = "std::thread::available_parallelism", reason = "differs between machines; take it from knobs or config" },
+
+    # The host environment differs between runs and machines: take settings from knobs or config.
+    { path = "std::env::var", reason = "the environment differs between runs; use knobs or config" },
+    { path = "std::env::var_os", reason = "the environment differs between runs; use knobs or config" },
+    { path = "std::env::vars", reason = "the environment differs between runs; use knobs or config" },
+    { path = "std::env::vars_os", reason = "the environment differs between runs; use knobs or config" },
+    { path = "std::process::id", reason = "differs between runs; use the process's Ctx" },
+
+    # Files: use ctx.disk().
+    { path = "std::fs::canonicalize", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::copy", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::create_dir", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::create_dir_all", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::exists", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::hard_link", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::metadata", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::read", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::read_dir", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::read_link", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::read_to_string", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::remove_dir", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::remove_dir_all", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::remove_file", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::rename", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::set_permissions", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::symlink_metadata", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::write", reason = "use ctx.disk(): the simulator models disks" },
+
+    # Sockets: use ctx.listen() and ctx.connect().
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "DNS lookups bypass the simulated network" },
+
+    # Randomness: use ctx.rng().
+    { path = "rand::thread_rng", reason = "use ctx.rng(): only the world's seeded PRNG is deterministic", allow-invalid = true },
+    { path = "rand::rng", reason = "use ctx.rng(): only the world's seeded PRNG is deterministic", allow-invalid = true },
+    { path = "rand::random", reason = "use ctx.rng(): only the world's seeded PRNG is deterministic", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "use ctx.rng(): only the world's seeded PRNG is deterministic", allow-invalid = true },
+    { path = "getrandom::fill", reason = "use ctx.rng(): only the world's seeded PRNG is deterministic", allow-invalid = true },
+
+    # Other runtimes (cargo-deny also keeps them out of the dependency graph; see deny.toml).
+    { path = "tokio::spawn", reason = "core code runs on basalt-env's Ctx, not tokio", allow-invalid = true },
+    { path = "tokio::task::spawn_local", reason = "core code runs on basalt-env's Ctx, not tokio", allow-invalid = true },
+    { path = "tokio::time::sleep", reason = "core code runs on basalt-env's Ctx, not tokio", allow-invalid = true },
+]
+
+disallowed-types = [
+    # Our `Instant` is basalt_env::Instant; std's can only come from the real clock.
+    { path = "std::time::Instant", reason = "use basalt_env::Instant from ctx.now()" },
+
+    # Random hashers make iteration order differ between runs of the same seed.
+    { path = "std::collections::HashMap", reason = "use basalt_env::HashMap, which has a fixed hasher" },
+    { path = "std::collections::HashSet", reason = "use basalt_env::HashSet, which has a fixed hasher" },
+    { path = "std::hash::RandomState", reason = "use basalt_env::FixedState: random hashers break determinism" },
+
+    { path = "std::fs::File", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::OpenOptions", reason = "use ctx.disk(): the simulator models disks" },
+    { path = "std::fs::DirBuilder", reason = "use ctx.disk(): the simulator models disks" },
+
+    { path = "std::net::TcpListener", reason = "use ctx.listen(): the simulator models the network" },
+    { path = "std::net::TcpStream", reason = "use ctx.connect(): the simulator models the network" },
+    { path = "std::net::UdpSocket", reason = "use ctx.connect(): the simulator models the network" },
+    { path = "std::os::unix::net::UnixStream", reason = "use ctx.connect(): the simulator models the network" },
+    { path = "std::os::unix::net::UnixListener", reason = "use ctx.listen(): the simulator models the network" },
+    { path = "std::os::unix::net::UnixDatagram", reason = "use ctx.connect(): the simulator models the network" },
+
+    { path = "std::process::Command", reason = "child processes run outside the simulation" },
+
+    { path = "tokio::runtime::Runtime", reason = "core code runs on basalt-env's Ctx, not tokio", allow-invalid = true },
+]
+
+disallowed-macros = [
+    { path = "std::thread_local", reason = "the ambient world in basalt-env is the only ambient state" },
+]

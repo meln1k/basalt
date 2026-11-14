@@ -1,0 +1,27 @@
+# cargo-deny: keeps other async runtimes out of the dependency graph. Core code runs only on
+# basalt-env's Ctx, so the simulator controls every task and timer.
+# Run with `cargo deny check bans`.
+
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    { crate = "tokio", reason = "core code runs on basalt-env's Ctx, not tokio" },
+    { crate = "async-std", reason = "another async runtime" },
+    { crate = "smol", reason = "another async runtime" },
+    { crate = "async-executor", reason = "another async runtime" },
+    { crate = "async-global-executor", reason = "another async runtime" },
+    { crate = "futures-executor", reason = "another async runtime" },
+    { crate = "glommio", reason = "another async runtime" },
+    { crate = "monoio", reason = "another async runtime" },
+    { crate = "tokio-uring", reason = "another async runtime" },
+    { crate = "actix-rt", reason = "another async runtime" },
+    # Reactors and `block_on`: only the production backend may run the real event loop.
+    { crate = "async-io", wrappers = ["basalt-rt"], reason = "only basalt-rt may use a real reactor" },
+    { crate = "polling", wrappers = ["async-io"], reason = "only basalt-rt may use a real reactor" },
+    { crate = "futures-lite", wrappers = ["async-io", "basalt-rt"], reason = "its block_on and timers bypass Ctx" },
+]

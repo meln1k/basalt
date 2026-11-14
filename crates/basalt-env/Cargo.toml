@@ -1,0 +1,12 @@
+[package]
+name = "basalt-env"
+description = "The only way Basalt's core code reaches time, randomness, the network, disks, and diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-task = "4.7.1"
+futures-io = "0.3.34"

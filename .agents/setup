@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Orb setup: the Rust toolchain pinned in rust-toolchain.toml, and cargo-deny.
+set -euo pipefail
+
+if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+        sh -s -- -y --profile minimal --default-toolchain none
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install
+
+if ! command -v cargo-deny >/dev/null 2>&1; then
+    version=0.20.2
+    dir=$(mktemp -d)
+    curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$version/cargo-deny-$version-x86_64-unknown-linux-musl.tar.gz" |
+        tar xz -C "$dir"
+    install "$dir"/*/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+    rm -rf "$dir"
+fi
+
+cargo fetch --locked

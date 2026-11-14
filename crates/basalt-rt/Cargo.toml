@@ -1,0 +1,9 @@
+[package]
+name = "basalt-rt"
+description = "The production backend: executor loop, async-io reactor, file I/O pool, and compute pool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+

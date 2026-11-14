@@ -1,0 +1,9 @@
+[package]
+name = "basalt"
+description = "The one shipped binary: basalt server and basalt sim."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
