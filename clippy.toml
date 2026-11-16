@@ -3,7 +3,6 @@
 #
 # These apply to every crate. The exemptions are `#![allow(...)]`s, and only in:
 # - basalt-rt, the production backend, which reaches the real world (all three lints, crate-wide);
-# - basalt-sim, which installs the ambient world (`thread_local!` only, crate-wide);
 # - basalt-env, which holds the ambient world (`thread_local!`, crate-wide, because clippy honors
 #   that allow only at the crate root) and wraps the std collections (item by item).
 # ci/lint-canary.sh checks that these lints still fire in core code.

@@ -85,6 +85,9 @@ version = "0.1.0"
 [[package]]
 name = "basalt-sim"
 version = "0.1.0"
+dependencies = [
+ "basalt-env",
+]
 
 [[package]]
 name = "clap"
