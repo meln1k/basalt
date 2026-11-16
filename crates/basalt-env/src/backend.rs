@@ -85,9 +85,12 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// A scheduled run of a task. Running it polls the task's future once.
 pub type Runnable = async_task::Runnable<TaskMeta>;
 
-/// Queues a runnable to be run. `async-task` requires it to be `Send + Sync` because wakers are,
-/// but backends must only accept runnables on their own thread: a wake from another thread
-/// would make the simulator nondeterministic.
+/// Queues a runnable to be run. `async-task` requires it to be `Send + Sync` because wakers are.
+///
+/// Every backend runs and drops runnables only on its own thread. The simulator also accepts
+/// them only on its own thread, and panics on a wake from any other, because such a wake would
+/// make the run nondeterministic. A production backend accepts wakes from any thread, such as
+/// its I/O pool or reactor threads, and hands the runnable to its own thread to run.
 pub type Scheduler = Arc<dyn Fn(Runnable) + Send + Sync>;
 
 /// Work for [`Backend::compute`], with its output boxed so the trait stays object-safe.

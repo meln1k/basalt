@@ -110,10 +110,14 @@ impl Executor {
     }
 
     /// Drops the future of every task `doomed` picks without polling it again, as a kill does
-    /// (`basalt_env::backend`): wakes each, then drops their queued runnables until none is left.
-    /// Dropping runs arbitrary `Drop` code, which may spawn or cancel tasks, so no borrow or lock
-    /// is held meanwhile.
-    pub(crate) fn drop_tasks(&self, doomed: impl Fn(&TaskMeta) -> bool) {
+    /// (`basalt_env::backend`): wakes each, then hands their queued runnables to `drop_one`,
+    /// which drops them, until none is left. Dropping runs arbitrary `Drop` code, which may spawn
+    /// or cancel tasks, so no borrow or lock is held meanwhile.
+    pub(crate) fn drop_tasks(
+        &self,
+        doomed: impl Fn(&TaskMeta) -> bool,
+        drop_one: impl Fn(Runnable),
+    ) {
         let wakers: Vec<Waker> = self
             .tasks
             .borrow()
@@ -129,7 +133,7 @@ impl Executor {
             if runnables.is_empty() {
                 return;
             }
-            drop(runnables);
+            runnables.into_iter().for_each(&drop_one);
         }
     }
 }

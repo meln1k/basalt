@@ -75,6 +75,26 @@ impl OpenOptions {
 /// Nothing is durable until it's synced: file contents by [`File::sync`], and creating,
 /// renaming, and removing files by [`Disk::sync_dir`] on the directory that holds them. In
 /// simulation, a power cut loses or corrupts anything not yet synced.
+///
+/// # Paths and directories
+///
+/// There is no `create_dir`: directories are implicit. Every backend follows these rules:
+///
+/// - A path is relative to the disk's root: non-empty components joined by `/`, with no `.` or
+///   `..`. Anything else fails with `InvalidInput`. A directory argument may also be `""`, the
+///   root.
+/// - Opening a file with `create` or `create_new`, or renaming a file, creates the missing
+///   directories above it.
+/// - `sync_dir(d)` makes durable the creating, renaming, and removing of files directly in `d`,
+///   and every directory on the path to `d`, including ones created above. Nothing else about
+///   directories is durable before that. A rename between two directories needs `sync_dir` of
+///   both. `sync_dir` of a directory that doesn't exist does nothing, since nothing in it can be
+///   lost.
+/// - `list` returns the names of the files directly in a directory, sorted, without
+///   subdirectories. A directory with no files lists as empty, whether or not it exists.
+/// - `remove` removes files only, and leaves empty directories behind.
+/// - A name is a file or a directory, never both. Opening, renaming, or removing a directory as
+///   a file fails with `IsADirectory`, and a path through a file fails with `NotADirectory`.
 #[derive(Clone)]
 pub struct Disk {
     id: DiskId,
@@ -103,12 +123,13 @@ impl Disk {
         self.io.remove(path).await
     }
 
-    /// The names of the entries in `dir`.
+    /// The names of the files directly in `dir`, sorted.
     pub async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
         self.io.list(dir).await
     }
 
-    /// Makes creating, renaming, and removing entries of `dir` durable.
+    /// Makes durable the creating, renaming, and removing of files directly in `dir`, and every
+    /// directory on the path to it.
     pub async fn sync_dir(&self, dir: &str) -> io::Result<()> {
         self.io.sync_dir(dir).await
     }

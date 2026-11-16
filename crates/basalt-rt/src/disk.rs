@@ -1,6 +1,6 @@
 //! Disks as directories on the host, with blocking file calls on the I/O pool.
 //!
-//! The path and directory rules are in the crate docs, under "Disks".
+//! The path and directory rules are in `basalt_env::Disk`'s docs, which both backends follow.
 
 use std::fs;
 use std::io;
