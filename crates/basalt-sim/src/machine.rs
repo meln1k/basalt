@@ -32,16 +32,18 @@ impl MachineId {
 }
 
 /// How [`SimControl::kill`](crate::SimControl::kill) takes a machine down. Every kind kills every
-/// process on the machine at once; they differ in what happens to its disks, which come with the
-/// simulated disks. Until then `PowerCut` and `DiskFail` act like `Crash`.
+/// process on the machine at once; they differ in what happens to its disks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KillType {
     /// A process crash or OOM kill. Unsynced writes survive, because the OS page cache outlives
     /// the process.
     Crash,
-    /// The whole machine loses power. Each pending page is kept, dropped, torn, or corrupted.
+    /// The whole machine loses power. Everything not yet synced may be lost: each pending page
+    /// is kept, dropped, torn, or corrupted, by the corruption mode its file was opened with,
+    /// and creating, renaming, and removing files not yet made durable by `sync_dir` may be
+    /// undone.
     PowerCut,
-    /// The machine's disks fail and are gone.
+    /// The machine's disks fail and are gone: it comes back with no disks.
     DiskFail,
     /// The machine is replaced: it comes back with new, empty disks under new [`DiskId`]s.
     Wipe,
@@ -70,6 +72,8 @@ pub(crate) struct Machines {
 struct Machine {
     zone: Rc<str>,
     disks: Rc<[DiskId]>,
+    /// How many disks it was added with, and gets again when it's replaced.
+    disk_count: usize,
     /// False from a kill until the next reboot.
     up: bool,
     /// How many times the machine has rebooted.
@@ -104,6 +108,7 @@ impl Machines {
         let machine = Machine {
             zone: zone.into(),
             disks: self.new_disks(disks),
+            disk_count: disks,
             up: true,
             boot: 0,
             clock: Rc::new(MachineClock::new(self.clock.clone())),
@@ -137,15 +142,21 @@ impl Machines {
         self.incarnate(label, machine, boot)
     }
 
-    /// Marks `machine` down, which kills every process on it, and applies what `kind` does to
-    /// its disks.
-    pub(crate) fn kill(&self, machine: MachineId, kind: KillType) {
-        let wiped = (kind == KillType::Wipe).then(|| self.new_disks(self.disks(machine).len()));
+    /// Marks `machine` down, which kills every process on it, and gives it new disk ids when
+    /// `kind` replaces or loses its disks. Returns the disks it had.
+    pub(crate) fn kill(&self, machine: MachineId, kind: KillType) -> Rc<[DiskId]> {
+        let count = self.machines.borrow()[machine.index()].disk_count;
+        let disks = match kind {
+            KillType::Wipe => Some(self.new_disks(count)),
+            KillType::DiskFail => Some(Rc::from([])),
+            KillType::Crash | KillType::PowerCut => None,
+        };
         let mut machines = self.machines.borrow_mut();
         let m = &mut machines[machine.index()];
         m.up = false;
-        if let Some(disks) = wiped {
-            m.disks = disks;
+        match disks {
+            Some(disks) => std::mem::replace(&mut m.disks, disks),
+            None => m.disks.clone(),
         }
     }
 
@@ -192,7 +203,7 @@ impl Machines {
         self.machines.borrow()[machine.index()].clock.clone()
     }
 
-    fn disks(&self, machine: MachineId) -> Rc<[DiskId]> {
+    pub(crate) fn disks(&self, machine: MachineId) -> Rc<[DiskId]> {
         self.machines.borrow()[machine.index()].disks.clone()
     }
 
@@ -203,6 +214,18 @@ impl Machines {
 
     pub(crate) fn machine_of(&self, process: ProcessId) -> MachineId {
         self.process(process, |p| p.machine)
+    }
+
+    /// Whether some machine has `disk` now.
+    pub(crate) fn has_disk(&self, disk: DiskId) -> bool {
+        self.disk_owner(disk).is_some()
+    }
+
+    /// The machine that has `disk` now, if any.
+    pub(crate) fn disk_owner(&self, disk: DiskId) -> Option<MachineId> {
+        let machines = self.machines.borrow();
+        let index = machines.iter().position(|m| m.disks.contains(&disk))?;
+        Some(MachineId(u32::try_from(index).expect("too many machines")))
     }
 
     pub(crate) fn alive(&self, process: ProcessId) -> bool {
