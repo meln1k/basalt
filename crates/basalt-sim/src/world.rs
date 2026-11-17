@@ -8,15 +8,16 @@ use std::io;
 use std::rc::Rc;
 
 use basalt_env::backend::{
-    Backend, ComputeJob, ComputeOutput, DetachedTask, DiskIo, FileIo, ListenerIo, LocalBoxFuture,
-    Runnable, Scheduler, StreamIo,
+    Backend, ComputeJob, ComputeOutput, DetachedTask, DiskIo, ListenerIo, LocalBoxFuture, Runnable,
+    Scheduler, StreamIo,
 };
 use basalt_env::world::{self, BuggifySite, Event, ProbeSite, World};
 use basalt_env::{
-    Cost, Ctx, DiskId, Duration, Instant, Knobs, OpenOptions, Priority, ProcessId, Rng, SocketAddr,
-    Space, SystemTime, TaskId, trace,
+    Cost, Ctx, DiskId, Duration, Instant, Knobs, Priority, ProcessId, Rng, SocketAddr, SystemTime,
+    TaskId, trace,
 };
 
+use crate::disk::Disks;
 use crate::executor::Executor;
 use crate::machine::{EntryPoint, KillType, MachineId, Machines};
 use crate::net::Net;
@@ -37,8 +38,9 @@ pub(crate) struct Streams {
     /// Latencies, short reads and writes, stall timeouts, and random resets, shared with the
     /// network.
     pub(crate) network: Rc<Rng>,
-    /// Corruption modes, power-cut outcomes, bit flips, I/O errors, and latency (T9).
-    pub(crate) disk: Rng,
+    /// Corruption modes, power-cut outcomes, bit flips, I/O errors, and latency. Shared with
+    /// the disks.
+    pub(crate) disk: Rc<Rng>,
     /// The swarm config and the fault workloads' targets and timing (T10, T12).
     pub(crate) faults: Rng,
     /// BUGGIFY site switches and firing (T10).
@@ -52,7 +54,7 @@ impl Streams {
         Streams {
             scheduler: Rng::derive(seed, "scheduler"),
             network: Rc::new(Rng::derive(seed, "network")),
-            disk: Rng::derive(seed, "disk"),
+            disk: Rc::new(Rng::derive(seed, "disk")),
             faults: Rng::derive(seed, "faults"),
             buggify: Rng::derive(seed, "buggify"),
             ctx: Rng::derive(seed, "ctx"),
@@ -68,7 +70,7 @@ impl Streams {
             buggify,
             ctx,
         } = self;
-        for rng in [scheduler, &**network, disk, faults, buggify, ctx] {
+        for rng in [scheduler, &**network, &**disk, faults, buggify, ctx] {
             rng.state().hash(hasher);
         }
     }
@@ -82,6 +84,7 @@ pub(crate) struct SimWorld {
     pub(crate) trace: TraceLog,
     pub(crate) machines: Rc<Machines>,
     pub(crate) net: Rc<Net>,
+    pub(crate) disks: Rc<Disks>,
     /// The process whose task is being polled or dropped, for trace labels.
     polling: Cell<Option<ProcessId>>,
     knobs: Rc<Knobs>,
@@ -98,11 +101,17 @@ impl SimWorld {
             machines.clone(),
             streams.network.clone(),
         ));
+        let disks = Rc::new(Disks::new(
+            machines.clone(),
+            clock.clone(),
+            streams.disk.clone(),
+        ));
         SimWorld {
             seed,
             streams,
             machines,
             net,
+            disks,
             clock,
             executor: Executor::new(shuffle),
             trace: TraceLog::new(),
@@ -134,9 +143,15 @@ impl SimWorld {
     /// except that of a task killing its own machine, which [`poll`](Self::poll) drops as soon
     /// as its current poll ends.
     pub(crate) fn kill(&self, machine: MachineId, kind: KillType) {
-        self.machines.kill(machine, kind);
+        let disks = self.machines.kill(machine, kind);
         trace!(Info, "MachineKilled", machine = machine.get(), kind = kind);
         self.net.processes_died();
+        match kind {
+            // The page cache outlives the processes.
+            KillType::Crash => {}
+            KillType::PowerCut => self.disks.power_cut(&disks),
+            KillType::DiskFail | KillType::Wipe => self.disks.remove(&disks),
+        }
         self.reap();
     }
 
@@ -153,10 +168,12 @@ impl SimWorld {
         }
     }
 
-    /// Lifts every fault: heals the network, stops every clock's drift, and reboots every
-    /// machine that's down. The network heals first, so rebooted processes start on it healed.
+    /// Lifts every fault: heals the network, clears every disk fault, stops every clock's
+    /// drift, and reboots every machine that's down. The network and disks recover first, so
+    /// rebooted processes start on them healed.
     pub(crate) fn lift_faults(self: &Rc<Self>) {
         self.net.heal();
+        self.disks.restore();
         for machine in self.machines.ids() {
             let clock = self.machines.clock(machine);
             // Only when drifting: a drift change wakes every sleeper on the machine.
@@ -340,10 +357,7 @@ impl Backend for SimWorld {
                 "{disk:?} is not a disk of {process:?}, which has {disks:?}"
             );
         }
-        Rc::new(NoDisk {
-            machines: self.machines.clone(),
-            process,
-        })
+        Rc::new(self.disks.disk(process, disk))
     }
 
     fn compute(
@@ -365,65 +379,6 @@ impl Backend for SimWorld {
             sleep.await;
             output
         })
-    }
-}
-
-/// The error for I/O through `process` on a part of the world not built yet, or the dead-process
-/// error once the process is dead.
-fn unavailable(machines: &Machines, process: ProcessId, what: &str) -> io::Error {
-    match machines.check_alive(process) {
-        Ok(()) => io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("the simulated {what} isn't built yet"),
-        ),
-        Err(dead) => dead,
-    }
-}
-
-/// Stands in for a disk until the simulated disk is built: every operation fails, with the
-/// dead-process error once its process is dead.
-struct NoDisk {
-    machines: Rc<Machines>,
-    process: ProcessId,
-}
-
-impl NoDisk {
-    fn fail<'a, T: 'a>(&self) -> LocalBoxFuture<'a, io::Result<T>> {
-        let error = unavailable(&self.machines, self.process, "disk");
-        Box::pin(async { Err(error) })
-    }
-}
-
-impl DiskIo for NoDisk {
-    fn open<'a>(
-        &'a self,
-        _: &'a str,
-        _: OpenOptions,
-    ) -> LocalBoxFuture<'a, io::Result<Box<dyn FileIo>>> {
-        self.fail()
-    }
-
-    fn rename<'a>(&'a self, _: &'a str, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        self.fail()
-    }
-
-    fn remove<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        self.fail()
-    }
-
-    fn list<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<Vec<String>>> {
-        self.fail()
-    }
-
-    fn sync_dir<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        self.fail()
-    }
-
-    fn space(&self) -> Space {
-        Space {
-            total: 0,
-            available: 0,
-        }
     }
 }
 

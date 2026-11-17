@@ -14,9 +14,14 @@
 //! clog, partition, and reset. Machine `n` has address `10.0.0.1 + n`
 //! ([`SimControl::ip`]), and `127.0.0.1` reaches a process's own machine.
 //!
+//! Disks keep only what's synced through a power cut (see [`KillType`]), and take virtual time
+//! for each operation by an IOPS and bandwidth model. Every disk fault, power-cut outcome, and
+//! latency draws from the `disk` stream.
+//!
 //! A run fails when no task can make progress ([`SimError::Hang`]) or when any code records an
 //! `Error` trace event ([`SimError::ErrorTrace`]). A panic in a task propagates out of the run.
 
+mod disk;
 mod executor;
 mod machine;
 mod net;
@@ -33,7 +38,9 @@ use std::task::{Context, Poll, Waker};
 
 use basalt_env::backend::LocalBoxFuture;
 use basalt_env::world::WorldGuard;
-use basalt_env::{Ctx, Duration, Instant, IpAddr, Priority, SystemTime, Task, TaskId, trace};
+use basalt_env::{
+    Ctx, DiskId, Duration, Instant, IpAddr, Priority, SystemTime, Task, TaskId, trace,
+};
 
 pub use crate::machine::{KillType, MachineId};
 pub use crate::trace::TraceRecord;
@@ -126,7 +133,7 @@ impl fmt::Debug for Sim {
 }
 
 /// Shapes a running simulation: adds machines and processes, kills and reboots machines, skews
-/// their clocks, and injects network faults. Disk faults come with the simulated disks. It
+/// their clocks, and injects network and disk faults. It
 /// lives in `basalt-sim`, so production code can't reach it.
 ///
 /// Every method may be called from inside a task, including one on the machine it kills.
@@ -194,8 +201,10 @@ impl SimControl {
     }
 
     /// Lifts every fault, for a test's quiet phase: heals the network as
-    /// [`heal_network`](SimControl::heal_network) does, reboots every machine that's down, and
-    /// stops every clock's drift. Wall-clock jumps stay, since undoing one is another jump.
+    /// [`heal_network`](SimControl::heal_network) does, clears every disk fault as
+    /// [`restore_disks`](SimControl::restore_disks) does, reboots every machine that's down, and
+    /// stops every clock's drift. Wall-clock jumps stay, since undoing one is another jump, and
+    /// so does whatever a power cut, wipe, or disk failure lost.
     /// Each kind of fault the simulator models is lifted here, next to the state it owns.
     pub fn lift_faults(&self) {
         self.world.lift_faults();
@@ -212,6 +221,41 @@ impl SimControl {
             !self.world.machines.is_protected(machine),
             "{fault} on {machine:?}, which is protected from faults"
         );
+    }
+
+    /// The disks of `machine` right now. A [`KillType::Wipe`] replaces them with new ones, and a
+    /// [`KillType::DiskFail`] leaves none.
+    pub fn disks(&self, machine: MachineId) -> Rc<[DiskId]> {
+        self.world.machines.disks(machine)
+    }
+
+    /// Fills `disk`: until [`restore_disks`](SimControl::restore_disks), creating a file and
+    /// anything that makes a file longer fail with `StorageFull` (`ENOSPC`), and
+    /// [`Disk::space`](basalt_env::Disk::space) reports nothing available. Panics if no machine
+    /// has `disk`.
+    pub fn fill_disk(&self, disk: DiskId) {
+        self.world.disks.fill(disk);
+    }
+
+    /// Makes each read and write on `disk` fail with `EIO` with probability `p`, until
+    /// [`restore_disks`](SimControl::restore_disks). A failed write changes nothing. Panics if
+    /// no machine has `disk`, or unless `0 <= p <= 1`.
+    pub fn set_disk_errors(&self, disk: DiskId, p: f64) {
+        self.world.disks.set_io_errors(disk, p);
+    }
+
+    /// Makes each read on `disk` return one flipped bit with probability `p`, until
+    /// [`restore_disks`](SimControl::restore_disks). The data on the disk stays intact. Panics
+    /// if no machine has `disk`, or unless `0 <= p <= 1`.
+    pub fn set_bit_flips(&self, disk: DiskId, p: f64) {
+        self.world.disks.set_bit_flips(disk, p);
+    }
+
+    /// Lifts every disk fault on every disk, for the quiet phase: full disks get their space
+    /// back, and reads and writes stop failing or flipping bits. What a power cut lost stays
+    /// lost.
+    pub fn restore_disks(&self) {
+        self.world.disks.restore();
     }
 
     /// The failure zone `machine` was added in.
