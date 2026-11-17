@@ -73,6 +73,7 @@ impl Streams {
 }
 
 pub(crate) struct SimWorld {
+    pub(crate) seed: u64,
     streams: Streams,
     pub(crate) clock: Rc<Clock>,
     pub(crate) executor: Executor,
@@ -89,6 +90,7 @@ impl SimWorld {
         let shuffle = streams.scheduler.bool(0.5);
         let clock = Rc::<Clock>::default();
         SimWorld {
+            seed,
             streams,
             machines: Rc::new(Machines::new(clock.clone())),
             clock,
@@ -138,6 +140,21 @@ impl SimWorld {
         for (id, entry) in starts {
             self.start(id, &entry);
         }
+    }
+
+    /// Lifts every fault: stops every clock's drift and reboots every machine that's down.
+    pub(crate) fn lift_faults(self: &Rc<Self>) {
+        for machine in self.machines.ids() {
+            let clock = self.machines.clock(machine);
+            // Only when drifting: a drift change wakes every sleeper on the machine.
+            if clock.drift() != 0 {
+                clock.set_drift(0);
+            }
+            if !self.machines.is_up(machine) {
+                self.reboot(machine);
+            }
+        }
+        trace!(Info, "FaultsLifted");
     }
 
     /// Drops every task of every dead process, each under its own process's trace label, since

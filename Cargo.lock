@@ -103,6 +103,8 @@ name = "basalt-harness"
 version = "0.1.0"
 dependencies = [
  "basalt-env",
+ "basalt-sim",
+ "clap",
 ]
 
 [[package]]

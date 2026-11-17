@@ -71,6 +71,8 @@ struct Machine {
     clock: Rc<MachineClock>,
     /// What runs on each boot.
     processes: Vec<(Rc<str>, EntryPoint)>,
+    /// Whether faults on it are refused (`SimControl::protect`).
+    protected: bool,
 }
 
 /// One incarnation of a process.
@@ -100,6 +102,7 @@ impl Machines {
             boot: 0,
             clock: Rc::new(MachineClock::new(self.clock.clone())),
             processes: Vec::new(),
+            protected: false,
         };
         let mut machines = self.machines.borrow_mut();
         let id = MachineId(u32::try_from(machines.len()).expect("too many machines"));
@@ -159,6 +162,20 @@ impl Machines {
 
     pub(crate) fn is_up(&self, machine: MachineId) -> bool {
         self.machines.borrow()[machine.index()].up
+    }
+
+    pub(crate) fn protect(&self, machine: MachineId) {
+        self.machines.borrow_mut()[machine.index()].protected = true;
+    }
+
+    pub(crate) fn is_protected(&self, machine: MachineId) -> bool {
+        self.machines.borrow()[machine.index()].protected
+    }
+
+    /// Every machine, protected or not.
+    pub(crate) fn ids(&self) -> Vec<MachineId> {
+        let n = u32::try_from(self.machines.borrow().len()).expect("too many machines");
+        (0..n).map(MachineId).collect()
     }
 
     pub(crate) fn zone(&self, machine: MachineId) -> Rc<str> {

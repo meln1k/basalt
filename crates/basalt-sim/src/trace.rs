@@ -47,7 +47,11 @@ pub(crate) struct TraceLog {
     hash: RefCell<DefaultHasher>,
     /// The first `Error` event, which fails the run.
     first_error: RefCell<Option<TraceRecord>>,
+    /// Called with each record as it's recorded.
+    sink: RefCell<Option<Sink>>,
 }
+
+pub(crate) type Sink = Box<dyn FnMut(&TraceRecord)>;
 
 impl TraceLog {
     pub(crate) fn new() -> TraceLog {
@@ -55,6 +59,7 @@ impl TraceLog {
             records: RefCell::default(),
             hash: RefCell::new(DefaultHasher::new()),
             first_error: RefCell::default(),
+            sink: RefCell::default(),
         }
     }
 
@@ -78,7 +83,18 @@ impl TraceLog {
                 .borrow_mut()
                 .get_or_insert_with(|| record.clone());
         }
+        // Taken out while it runs, so a sink that traces doesn't hit a borrowed `RefCell`; what
+        // it traces isn't passed back to it.
+        let sink = self.sink.borrow_mut().take();
+        if let Some(mut sink) = sink {
+            sink(&record);
+            self.sink.borrow_mut().get_or_insert(sink);
+        }
         self.records.borrow_mut().push(record);
+    }
+
+    pub(crate) fn set_sink(&self, sink: Sink) {
+        *self.sink.borrow_mut() = Some(sink);
     }
 
     pub(crate) fn records(&self) -> Ref<'_, [TraceRecord]> {

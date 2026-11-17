@@ -92,6 +92,12 @@ impl Sim {
         self.world.trace.records()
     }
 
+    /// Calls `sink` with each trace event as it's recorded, for example to print a run's trace
+    /// as it happens, so a panic doesn't lose it. Replaces any earlier sink.
+    pub fn on_trace(&self, sink: impl FnMut(&TraceRecord) + 'static) {
+        self.world.trace.set_sink(Box::new(sink));
+    }
+
     /// A hash of every random stream's state and of the trace so far. Running a seed twice on
     /// the same build must give the same unseed, or the run is nondeterministic.
     pub fn unseed(&self) -> u64 {
@@ -149,6 +155,7 @@ impl SimControl {
     /// machine: it is dropped as soon as its current poll ends, before any other task runs.
     /// Killing a machine that's down applies only what `kind` does to its disks.
     pub fn kill(&self, machine: MachineId, kind: KillType) {
+        self.refuse_if_protected(machine, "kill");
         self.world.kill(machine, kind);
     }
 
@@ -156,12 +163,49 @@ impl SimControl {
     /// rerunning its entry point. A machine that's up is first killed with
     /// [`KillType::Crash`].
     pub fn reboot(&self, machine: MachineId) {
+        self.refuse_if_protected(machine, "reboot");
         self.world.reboot(machine);
     }
 
     /// Whether `machine` is running, rather than killed and not yet rebooted.
     pub fn is_up(&self, machine: MachineId) -> bool {
         self.world.machines.is_up(machine)
+    }
+
+    /// Every machine added so far that isn't [protected](SimControl::protect), up or down, in
+    /// the order they were added. Fault workloads pick their targets from these.
+    pub fn machines(&self) -> Vec<MachineId> {
+        let machines = &self.world.machines;
+        let mut ids = machines.ids();
+        ids.retain(|&m| !machines.is_protected(m));
+        ids
+    }
+
+    /// Protects `machine` from faults: it's left out of [`machines`](SimControl::machines),
+    /// and killing, rebooting, or skewing the clocks of it panics. The test harness protects
+    /// the machine its workloads run on, since a run can't end once that machine is gone.
+    pub fn protect(&self, machine: MachineId) {
+        self.world.machines.protect(machine);
+    }
+
+    /// Lifts every fault, for a test's quiet phase: reboots every machine that's down and
+    /// stops every clock's drift. Wall-clock jumps stay, since undoing one is another jump.
+    /// Each kind of fault the simulator models is lifted here, next to the state it owns.
+    pub fn lift_faults(&self) {
+        self.world.lift_faults();
+    }
+
+    /// The run's seed, to name a run, such as a self-test planting a failure at a known seed.
+    /// Draw randomness from `ctx.rng()`, never from the seed.
+    pub fn seed(&self) -> u64 {
+        self.world.seed
+    }
+
+    fn refuse_if_protected(&self, machine: MachineId, fault: &str) {
+        assert!(
+            !self.world.machines.is_protected(machine),
+            "{fault} on {machine:?}, which is protected from faults"
+        );
     }
 
     /// The failure zone `machine` was added in.
@@ -175,12 +219,14 @@ impl SimControl {
     ///
     /// Timers already set on the machine move to the new rate.
     pub fn set_clock_drift(&self, machine: MachineId, ppm: i32) {
+        self.refuse_if_protected(machine, "set_clock_drift");
         self.world.machines.clock(machine).set_drift(ppm);
     }
 
     /// Jumps `machine`'s wall clock, forward or back, so that it reads `to` now. Its monotonic
     /// clock is unchanged.
     pub fn set_wall_clock(&self, machine: MachineId, to: SystemTime) {
+        self.refuse_if_protected(machine, "set_wall_clock");
         self.world.machines.clock(machine).set_wall(to);
     }
 
