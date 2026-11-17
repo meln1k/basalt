@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::io;
 use std::rc::Rc;
 
 use basalt_env::backend::LocalBoxFuture;
@@ -18,6 +19,11 @@ pub struct MachineId(u32);
 impl MachineId {
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests(raw: u32) -> MachineId {
+        MachineId(raw)
     }
 
     fn index(self) -> usize {
@@ -190,6 +196,15 @@ impl Machines {
         self.machines.borrow()[machine.index()].disks.clone()
     }
 
+    /// The machine with this index, if there is one.
+    pub(crate) fn machine(&self, index: u32) -> Option<MachineId> {
+        (index < self.machines.borrow().len() as u32).then_some(MachineId(index))
+    }
+
+    pub(crate) fn machine_of(&self, process: ProcessId) -> MachineId {
+        self.process(process, |p| p.machine)
+    }
+
     pub(crate) fn alive(&self, process: ProcessId) -> bool {
         let (machine, boot) = self.process(process, |p| (p.machine, p.boot));
         let machines = self.machines.borrow();
@@ -197,17 +212,27 @@ impl Machines {
         m.up && m.boot == boot
     }
 
+    /// The error every I/O operation of a dead process returns, by the dead-process rules in
+    /// `basalt_env::backend`.
+    pub(crate) fn check_alive(&self, process: ProcessId) -> io::Result<()> {
+        if self.alive(process) {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{process:?} is dead")))
+        }
+    }
+
     pub(crate) fn label(&self, process: ProcessId) -> Rc<str> {
         self.process(process, |p| p.label.clone())
     }
 
     pub(crate) fn clock_of(&self, process: ProcessId) -> Rc<MachineClock> {
-        self.clock(self.process(process, |p| p.machine))
+        self.clock(self.machine_of(process))
     }
 
     /// The disks of the process's machine right now.
     pub(crate) fn disks_of(&self, process: ProcessId) -> Rc<[DiskId]> {
-        self.disks(self.process(process, |p| p.machine))
+        self.disks(self.machine_of(process))
     }
 
     fn process<R>(&self, process: ProcessId, f: impl FnOnce(&Process) -> R) -> R {

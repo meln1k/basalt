@@ -19,6 +19,7 @@ use basalt_env::{
 
 use crate::executor::Executor;
 use crate::machine::{EntryPoint, KillType, MachineId, Machines};
+use crate::net::Net;
 use crate::time::Clock;
 use crate::trace::TraceLog;
 use crate::{BlockedTask, Hang, SimError};
@@ -33,8 +34,9 @@ const MAX_TIMER_LATENESS: Duration = Duration::from_millis(1);
 pub(crate) struct Streams {
     /// Picks among ready tasks of equal priority, and how late timers fire.
     pub(crate) scheduler: Rng,
-    /// Latency, bandwidth, and random resets (T8).
-    pub(crate) network: Rng,
+    /// Latencies, short reads and writes, stall timeouts, and random resets, shared with the
+    /// network.
+    pub(crate) network: Rc<Rng>,
     /// Corruption modes, power-cut outcomes, bit flips, I/O errors, and latency (T9).
     pub(crate) disk: Rng,
     /// The swarm config and the fault workloads' targets and timing (T10, T12).
@@ -49,7 +51,7 @@ impl Streams {
     fn new(seed: u64) -> Streams {
         Streams {
             scheduler: Rng::derive(seed, "scheduler"),
-            network: Rng::derive(seed, "network"),
+            network: Rc::new(Rng::derive(seed, "network")),
             disk: Rng::derive(seed, "disk"),
             faults: Rng::derive(seed, "faults"),
             buggify: Rng::derive(seed, "buggify"),
@@ -66,7 +68,7 @@ impl Streams {
             buggify,
             ctx,
         } = self;
-        for rng in [scheduler, network, disk, faults, buggify, ctx] {
+        for rng in [scheduler, &**network, disk, faults, buggify, ctx] {
             rng.state().hash(hasher);
         }
     }
@@ -79,6 +81,7 @@ pub(crate) struct SimWorld {
     pub(crate) executor: Executor,
     pub(crate) trace: TraceLog,
     pub(crate) machines: Rc<Machines>,
+    pub(crate) net: Rc<Net>,
     /// The process whose task is being polled or dropped, for trace labels.
     polling: Cell<Option<ProcessId>>,
     knobs: Rc<Knobs>,
@@ -89,10 +92,17 @@ impl SimWorld {
         let streams = Streams::new(seed);
         let shuffle = streams.scheduler.bool(0.5);
         let clock = Rc::<Clock>::default();
+        let machines = Rc::new(Machines::new(clock.clone()));
+        let net = Rc::new(Net::new(
+            clock.clone(),
+            machines.clone(),
+            streams.network.clone(),
+        ));
         SimWorld {
             seed,
             streams,
-            machines: Rc::new(Machines::new(clock.clone())),
+            machines,
+            net,
             clock,
             executor: Executor::new(shuffle),
             trace: TraceLog::new(),
@@ -126,6 +136,7 @@ impl SimWorld {
     pub(crate) fn kill(&self, machine: MachineId, kind: KillType) {
         self.machines.kill(machine, kind);
         trace!(Info, "MachineKilled", machine = machine.get(), kind = kind);
+        self.net.processes_died();
         self.reap();
     }
 
@@ -142,8 +153,10 @@ impl SimWorld {
         }
     }
 
-    /// Lifts every fault: stops every clock's drift and reboots every machine that's down.
+    /// Lifts every fault: heals the network, stops every clock's drift, and reboots every
+    /// machine that's down. The network heals first, so rebooted processes start on it healed.
     pub(crate) fn lift_faults(self: &Rc<Self>) {
+        self.net.heal();
         for machine in self.machines.ids() {
             let clock = self.machines.clock(machine);
             // Only when drifting: a drift change wakes every sleeper on the machine.
@@ -300,19 +313,18 @@ impl Backend for SimWorld {
     fn listen(
         &self,
         process: ProcessId,
-        _: u16,
+        port: u16,
     ) -> LocalBoxFuture<'_, io::Result<Box<dyn ListenerIo>>> {
-        let error = unavailable(&self.machines, process, "network");
-        Box::pin(async { Err(error) })
+        let listener = self.net.listen(process, port);
+        Box::pin(async { listener })
     }
 
     fn connect(
         &self,
         process: ProcessId,
-        _: SocketAddr,
+        addr: SocketAddr,
     ) -> LocalBoxFuture<'_, io::Result<Box<dyn StreamIo>>> {
-        let error = unavailable(&self.machines, process, "network");
-        Box::pin(async { Err(error) })
+        Box::pin(self.net.clone().connect(process, addr))
     }
 
     fn disks(&self, process: ProcessId) -> Rc<[DiskId]> {
@@ -359,13 +371,12 @@ impl Backend for SimWorld {
 /// The error for I/O through `process` on a part of the world not built yet, or the dead-process
 /// error once the process is dead.
 fn unavailable(machines: &Machines, process: ProcessId, what: &str) -> io::Error {
-    if machines.alive(process) {
-        io::Error::new(
+    match machines.check_alive(process) {
+        Ok(()) => io::Error::new(
             io::ErrorKind::Unsupported,
             format!("the simulated {what} isn't built yet"),
-        )
-    } else {
-        io::Error::other(format!("{process:?} is dead"))
+        ),
+        Err(dead) => dead,
     }
 }
 

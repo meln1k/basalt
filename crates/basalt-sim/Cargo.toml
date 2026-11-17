@@ -9,3 +9,7 @@ publish.workspace = true
 
 [dependencies]
 basalt-env = { path = "../basalt-env" }
+futures-io = "0.3.34"
+
+[dev-dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }

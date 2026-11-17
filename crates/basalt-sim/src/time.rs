@@ -117,6 +117,31 @@ impl Drop for Sleep {
     }
 }
 
+/// A virtual timer that can be moved: each poll sets it for a time, replacing the timer if the
+/// time changed.
+#[derive(Default)]
+pub(crate) struct Timer(Option<(Instant, Sleep)>);
+
+impl Timer {
+    /// Polls a timer for `at`, setting one up if it isn't set for `at` already.
+    pub(crate) fn poll_at(
+        &mut self,
+        clock: &Rc<Clock>,
+        at: Instant,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        if self.0.as_ref().is_none_or(|(set, _)| *set != at) {
+            self.0 = Some((at, clock.sleep_until(at)));
+        }
+        let (_, sleep) = self.0.as_mut().expect("just set");
+        Pin::new(sleep).poll(cx)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
 /// What every machine's wall clock reads at virtual time zero: 2026-01-01T00:00:00Z, in
 /// nanoseconds since the Unix epoch.
 const WALL_CLOCK_START: i128 = 1_767_225_600 * 1_000_000_000;
@@ -195,7 +220,7 @@ impl MachineClock {
         LocalSleep {
             machine: self.clone(),
             deadline,
-            timer: None,
+            timer: Timer::default(),
             sleeper: None,
         }
     }
@@ -257,8 +282,8 @@ pub(crate) struct LocalSleep {
     machine: Rc<MachineClock>,
     /// On the machine's clock.
     deadline: Instant,
-    /// The virtual timer, and the virtual time it's set for.
-    timer: Option<(Instant, Sleep)>,
+    /// The virtual timer for when the machine's clock reaches the deadline.
+    timer: Timer,
     /// Its id among the machine's sleepers, once pending.
     sleeper: Option<u64>,
 }
@@ -272,7 +297,7 @@ impl Future for LocalSleep {
         }
         let machine = &this.machine;
         if machine.now() >= this.deadline {
-            this.timer = None;
+            this.timer.clear();
             if let Some(id) = this.sleeper.take() {
                 machine.forget(id);
             }
@@ -280,11 +305,7 @@ impl Future for LocalSleep {
         }
         // Still ahead of now, since the machine's clock hasn't reached the deadline.
         let at = machine.virtual_time(this.deadline);
-        if this.timer.as_ref().is_none_or(|(set, _)| *set != at) {
-            this.timer = Some((at, machine.clock.sleep_until(at)));
-        }
-        let (_, timer) = this.timer.as_mut().expect("just set");
-        let fired = Pin::new(timer).poll(cx);
+        let fired = this.timer.poll_at(&machine.clock, at, cx);
         debug_assert!(
             fired.is_pending(),
             "the timer is set for a time still ahead"

@@ -10,11 +10,16 @@
 //! time its machine reboots. Killing a machine drops every future of its processes at once, by
 //! the kill and dead-process rules in `basalt_env::backend`.
 //!
+//! Processes talk over a simulated network of TCP-like connections, which [`SimControl`] can
+//! clog, partition, and reset. Machine `n` has address `10.0.0.1 + n`
+//! ([`SimControl::ip`]), and `127.0.0.1` reaches a process's own machine.
+//!
 //! A run fails when no task can make progress ([`SimError::Hang`]) or when any code records an
 //! `Error` trace event ([`SimError::ErrorTrace`]). A panic in a task propagates out of the run.
 
 mod executor;
 mod machine;
+mod net;
 mod time;
 mod trace;
 mod world;
@@ -28,7 +33,7 @@ use std::task::{Context, Poll, Waker};
 
 use basalt_env::backend::LocalBoxFuture;
 use basalt_env::world::WorldGuard;
-use basalt_env::{Ctx, Instant, Priority, SystemTime, Task, TaskId};
+use basalt_env::{Ctx, Duration, Instant, IpAddr, Priority, SystemTime, Task, TaskId, trace};
 
 pub use crate::machine::{KillType, MachineId};
 pub use crate::trace::TraceRecord;
@@ -120,8 +125,8 @@ impl fmt::Debug for Sim {
     }
 }
 
-/// Shapes a running simulation: adds machines and processes, kills and reboots machines, and
-/// skews their clocks. Network and disk faults come with the simulated network and disks. It
+/// Shapes a running simulation: adds machines and processes, kills and reboots machines, skews
+/// their clocks, and injects network faults. Disk faults come with the simulated disks. It
 /// lives in `basalt-sim`, so production code can't reach it.
 ///
 /// Every method may be called from inside a task, including one on the machine it kills.
@@ -188,7 +193,8 @@ impl SimControl {
         self.world.machines.protect(machine);
     }
 
-    /// Lifts every fault, for a test's quiet phase: reboots every machine that's down and
+    /// Lifts every fault, for a test's quiet phase: heals the network as
+    /// [`heal_network`](SimControl::heal_network) does, reboots every machine that's down, and
     /// stops every clock's drift. Wall-clock jumps stay, since undoing one is another jump.
     /// Each kind of fault the simulator models is lifted here, next to the state it owns.
     pub fn lift_faults(&self) {
@@ -238,6 +244,69 @@ impl SimControl {
     /// The current virtual time.
     pub fn now(&self) -> Instant {
         self.world.clock.now()
+    }
+
+    // Network
+
+    /// `machine`'s address on the simulated network. Its processes listen on it, on every port.
+    pub fn ip(&self, machine: MachineId) -> IpAddr {
+        net::ip(machine)
+    }
+
+    /// Delays everything `from` sends to `to`, from now for `d`: bytes and connects that would
+    /// arrive meanwhile arrive when the clog ends instead. Lengthens a clog that's still on.
+    pub fn clog_pair(&self, from: MachineId, to: MachineId, d: Duration) {
+        trace!(
+            Info,
+            "ClogPair",
+            from = from.get(),
+            to = to.get(),
+            duration = d
+        );
+        self.world.net.clog_pair(from, to, d);
+    }
+
+    /// Like [`clog_pair`](SimControl::clog_pair), for everything `machine` sends.
+    pub fn clog_sends(&self, machine: MachineId, d: Duration) {
+        trace!(Info, "ClogSends", machine = machine.get(), duration = d);
+        self.world.net.clog_sends(machine, d);
+    }
+
+    /// Like [`clog_pair`](SimControl::clog_pair), for everything `machine` receives.
+    pub fn clog_receives(&self, machine: MachineId, d: Duration) {
+        trace!(Info, "ClogReceives", machine = machine.get(), duration = d);
+        self.world.net.clog_receives(machine, d);
+    }
+
+    /// Stops everything `from` sends to `to` from arriving, until
+    /// [`heal_network`](SimControl::heal_network). Connects time out, and a connection that has
+    /// something held back resets once it has waited 5 to 30 seconds, drawn per connection, as
+    /// TCP gives up retransmitting. Bytes from `to` to `from` still arrive.
+    pub fn partition(&self, from: MachineId, to: MachineId) {
+        trace!(Info, "Partition", from = from.get(), to = to.get());
+        self.world.net.partition(from, to);
+    }
+
+    /// [`partition`](SimControl::partition) in both directions.
+    pub fn partition_two_way(&self, a: MachineId, b: MachineId) {
+        self.partition(a, b);
+        self.partition(b, a);
+    }
+
+    /// Resets connections at random: from now on, each write resets its connection with
+    /// probability `p`, until [`heal_network`](SimControl::heal_network). Panics unless
+    /// `0 <= p <= 1`.
+    pub fn set_reset_probability(&self, p: f64) {
+        trace!(Info, "ResetProbability", p = p);
+        self.world.net.set_reset_probability(p);
+    }
+
+    /// Lifts every network fault, for the quiet phase: ends every clog and partition and stops
+    /// random resets. Bytes held back arrive at once. A connection whose stall timeout has
+    /// already passed stays reset.
+    pub fn heal_network(&self) {
+        trace!(Info, "NetworkHealed");
+        self.world.net.heal();
     }
 }
 
