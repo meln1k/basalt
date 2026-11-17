@@ -58,6 +58,7 @@
 //! | Read or write failed (`EIO`) | Built with `Error::from_raw_os_error(5)`, as on Linux |
 //! | Connection reset, by a fault or a killed peer | `ConnectionReset` |
 //! | Nothing listening at the address | `ConnectionRefused` |
+//! | A connect gets no answer (machine down, unknown, or partitioned away) | `TimedOut` |
 //! | Port already in use | `AddrInUse` |
 //! | File not found | `NotFound` |
 //! | File exists (`create_new`) | `AlreadyExists` |
