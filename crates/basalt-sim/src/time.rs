@@ -179,6 +179,10 @@ impl MachineClock {
         }
     }
 
+    pub(crate) fn drift(&self) -> i32 {
+        self.drift_ppm.get()
+    }
+
     /// Sets the wall clock to read `to` now.
     pub(crate) fn set_wall(&self, to: SystemTime) {
         self.wall_offset

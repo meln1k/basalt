@@ -47,3 +47,14 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked
+
+  # Runs a sample of seeds twice from the release binary, the build a deployment ships, and
+  # fails if any seed's two runs end with different unseeds.
+  determinism:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin basalt
+      - run: target/release/basalt sim check-determinism --test ping-pong --seeds 0..200

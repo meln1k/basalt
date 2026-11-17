@@ -3,6 +3,7 @@
 
 use std::process::ExitCode;
 
+use basalt_harness::cli::SimCommand;
 use clap::{Parser, Subcommand};
 
 /// Basalt: run a server, or run the deterministic simulation tests built into this binary.
@@ -22,26 +23,14 @@ enum Command {
     Sim(SimCommand),
 }
 
-#[derive(Subcommand)]
-enum SimCommand {
-    /// List the tests built into this binary.
-    List,
-    /// Run one test with one seed and print its full trace.
-    Run,
-    /// Run a test over a range of seeds in parallel child processes.
-    Sweep,
-    /// Run each seed twice and check that both runs end with the same unseed.
-    CheckDeterminism,
-}
-
 fn main() -> ExitCode {
-    let name = match Cli::parse().command {
-        Command::Server => "server",
-        Command::Sim(SimCommand::List) => "sim list",
-        Command::Sim(SimCommand::Run) => "sim run",
-        Command::Sim(SimCommand::Sweep) => "sim sweep",
-        Command::Sim(SimCommand::CheckDeterminism) => "sim check-determinism",
-    };
-    eprintln!("basalt {name}: not implemented yet");
-    ExitCode::FAILURE
+    match Cli::parse().command {
+        Command::Server => {
+            eprintln!("basalt server: not implemented yet");
+            ExitCode::FAILURE
+        }
+        Command::Sim(command) => {
+            basalt_harness::cli::main(command, basalt_harness::selftest::TESTS)
+        }
+    }
 }
