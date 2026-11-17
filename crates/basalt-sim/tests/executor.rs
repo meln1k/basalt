@@ -295,6 +295,8 @@ fn timers_fire_at_their_deadline_or_slightly_later() {
     let late = Rc::new(Cell::new(0));
     for seed in 0..20 {
         let sim = Sim::new(seed);
+        // Turns BUGGIFY off, which would make some sleeps much later.
+        sim.control().lift_faults();
         let ctx = process(&sim, "p");
         for _ in 0..5 {
             let (c, l) = (ctx.clone(), late.clone());

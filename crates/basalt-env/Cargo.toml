@@ -10,3 +10,4 @@ publish.workspace = true
 [dependencies]
 async-task = "4.7.1"
 futures-io = "0.3.34"
+linkme = "0.3.38"

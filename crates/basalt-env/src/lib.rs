@@ -17,7 +17,9 @@
 // basalt-env holds the ambient world, the one sanctioned `thread_local!` outside the backends.
 // (Clippy honors this allow only at the crate root.)
 #![allow(clippy::disallowed_macros)]
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: registering each `buggify!` and `probe!` site with `linkme` takes a
+// `link_section`, which the macros allow on the site alone.
+#![deny(unsafe_code)]
 
 pub mod backend;
 mod collections;

@@ -42,23 +42,52 @@ pub trait World {
 /// How often a switched-on `buggify!()` site fires when reached, as in FoundationDB.
 pub const BUGGIFY_FIRE_PROBABILITY: f64 = 0.25;
 
-/// Where a `buggify!` is in the source. Identify a site by `(file, line, column)`, never by its
-/// address: addresses change between runs, so a map keyed by them iterates in a different order
-/// each run.
-#[derive(Debug)]
-pub struct BuggifySite {
+/// Where a `buggify!` or `probe!` is in the source. Identify a site by its location, never by
+/// its address: addresses change between runs, so a map keyed by them iterates in a different
+/// order each run.
+///
+/// `line!()` and `column!()` resolve to the outermost macro call, so sites that one user macro
+/// expands at the same call share a location, and count as one site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Location {
     pub file: &'static str,
     pub line: u32,
     pub column: u32,
 }
 
-/// A `probe!`: its name and where it is in the source.
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.file, self.line, self.column)
+    }
+}
+
+/// A `buggify!` site. Every site in the binary is in [`BUGGIFY_SITES`], reached or not.
+#[derive(Debug)]
+pub struct BuggifySite {
+    pub location: Location,
+}
+
+/// A `probe!`: its name and where it is. Every probe in the binary is in [`PROBE_SITES`],
+/// reached or not.
 #[derive(Debug)]
 pub struct ProbeSite {
     pub name: &'static str,
-    pub file: &'static str,
-    pub line: u32,
+    pub location: Location,
 }
+
+/// Every `buggify!` site linked into the binary, including ones no run ever reaches, so a
+/// sweep can report the sites that never fired. In link order, which is arbitrary: sort by
+/// [`Location`] before relying on an order.
+#[linkme::distributed_slice]
+pub static BUGGIFY_SITES: [BuggifySite];
+
+/// Every `probe!` linked into the binary, including ones no run ever reaches. In link order,
+/// like [`BUGGIFY_SITES`].
+#[linkme::distributed_slice]
+pub static PROBE_SITES: [ProbeSite];
+
+#[doc(hidden)]
+pub use linkme as __linkme;
 
 /// How serious a [`trace!`](crate::trace!) event is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -231,13 +260,27 @@ macro_rules! buggify {
         $crate::buggify!($crate::world::BUGGIFY_FIRE_PROBABILITY)
     };
     ($fire:expr) => {{
+        #[$crate::world::__linkme::distributed_slice($crate::world::BUGGIFY_SITES)]
+        #[linkme(crate = $crate::world::__linkme)]
+        // Registering takes a `link_section`, which counts as unsafe code.
+        #[allow(unsafe_code)]
         static SITE: $crate::world::BuggifySite = $crate::world::BuggifySite {
-            file: ::core::file!(),
-            line: ::core::line!(),
-            column: ::core::column!(),
+            location: $crate::__location!(),
         };
         $crate::world::__buggify(&SITE, $fire)
     }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __location {
+    () => {
+        $crate::world::Location {
+            file: ::core::file!(),
+            line: ::core::line!(),
+            column: ::core::column!(),
+        }
+    };
 }
 
 /// Marks a rare path, so a sweep can report probes that no seed reached.
@@ -248,10 +291,13 @@ macro_rules! buggify {
 #[macro_export]
 macro_rules! probe {
     ($name:literal) => {{
+        #[$crate::world::__linkme::distributed_slice($crate::world::PROBE_SITES)]
+        #[linkme(crate = $crate::world::__linkme)]
+        // Registering takes a `link_section`, which counts as unsafe code.
+        #[allow(unsafe_code)]
         static SITE: $crate::world::ProbeSite = $crate::world::ProbeSite {
             name: $name,
-            file: ::core::file!(),
-            line: ::core::line!(),
+            location: $crate::__location!(),
         };
         $crate::world::__probe(&SITE)
     }};
@@ -322,7 +368,9 @@ mod tests {
             true
         }
         fn buggify(&self, site: &'static BuggifySite, fire: f64) -> bool {
-            self.buggify_calls.borrow_mut().push((site.line, fire));
+            self.buggify_calls
+                .borrow_mut()
+                .push((site.location.line, fire));
             true
         }
         fn probe(&self, site: &'static ProbeSite) {
@@ -379,6 +427,27 @@ mod tests {
         assert!(is_simulated());
         crate::probe!("test.after_without");
         assert_eq!(*world.probes.borrow(), ["test.after_without"]);
+    }
+
+    #[allow(dead_code, reason = "registered, never called")]
+    fn never_called() {
+        if crate::buggify!(0.5) {
+            crate::probe!("test.never_called");
+        }
+    }
+
+    #[test]
+    fn every_site_is_registered_even_if_never_reached() {
+        let probe = PROBE_SITES
+            .iter()
+            .find(|s| s.name == "test.never_called")
+            .expect("registered");
+        assert_eq!(probe.location.file, file!());
+        // `never_called`'s buggify! is on the line before its probe!.
+        let buggify = BUGGIFY_SITES
+            .iter()
+            .find(|s| s.location.file == file!() && s.location.line == probe.location.line - 1);
+        assert!(buggify.is_some(), "{:?}", probe.location);
     }
 
     #[test]
