@@ -1,23 +1,24 @@
 //! The simulated world: the run loop, and the `Backend` and ambient `World` it implements by
 //! delegating to the executor, the clock, and the trace.
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::future::pending;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::rc::Rc;
 
 use basalt_env::backend::{
-    Backend, ComputeJob, ComputeOutput, DetachedTask, DiskIo, ListenerIo, LocalBoxFuture, Runnable,
-    Scheduler, StreamIo,
+    Backend, ComputeJob, ComputeOutput, DetachedTask, DiskIo, FileIo, ListenerIo, LocalBoxFuture,
+    Runnable, Scheduler, StreamIo,
 };
 use basalt_env::world::{self, BuggifySite, Event, ProbeSite, World};
 use basalt_env::{
-    Cost, Ctx, DiskId, Duration, Instant, Knobs, Priority, ProcessId, Rng, SocketAddr, SystemTime,
-    TaskId, UNIX_EPOCH,
+    Cost, Ctx, DiskId, Duration, Instant, Knobs, OpenOptions, Priority, ProcessId, Rng, SocketAddr,
+    Space, SystemTime, TaskId, trace,
 };
 
 use crate::executor::Executor;
+use crate::machine::{EntryPoint, KillType, MachineId, Machines};
 use crate::time::Clock;
 use crate::trace::TraceLog;
 use crate::{BlockedTask, Hang, SimError};
@@ -26,9 +27,6 @@ use crate::{BlockedTask, Hang, SimError};
 /// late, never early, so code must not depend on exactly when they fire.
 const LATE_TIMER_PROBABILITY: f64 = 0.01;
 const MAX_TIMER_LATENESS: Duration = Duration::from_millis(1);
-
-/// What the wall clock reads at virtual time zero: 2026-01-01T00:00:00Z.
-const WALL_CLOCK_START: Duration = Duration::from_secs(1_767_225_600);
 
 /// The run's seed split into one stream per concern (design doc, "Randomness"). Each draw
 /// belongs to exactly one stream, so drawing more from one never shifts the others.
@@ -79,10 +77,8 @@ pub(crate) struct SimWorld {
     pub(crate) clock: Rc<Clock>,
     pub(crate) executor: Executor,
     pub(crate) trace: TraceLog,
-    next_process: Cell<u32>,
-    /// Each process's label, for traces and hang reports.
-    processes: RefCell<BTreeMap<ProcessId, Rc<str>>>,
-    /// The process whose task is being polled.
+    pub(crate) machines: Rc<Machines>,
+    /// The process whose task is being polled or dropped, for trace labels.
     polling: Cell<Option<ProcessId>>,
     knobs: Rc<Knobs>,
 }
@@ -91,31 +87,80 @@ impl SimWorld {
     pub(crate) fn new(seed: u64) -> SimWorld {
         let streams = Streams::new(seed);
         let shuffle = streams.scheduler.bool(0.5);
+        let clock = Rc::<Clock>::default();
         SimWorld {
             streams,
-            clock: Rc::default(),
+            machines: Rc::new(Machines::new(clock.clone())),
+            clock,
             executor: Executor::new(shuffle),
             trace: TraceLog::new(),
-            next_process: Cell::new(0),
-            processes: RefCell::default(),
             polling: Cell::new(None),
             knobs: Rc::default(),
         }
     }
 
-    pub(crate) fn add_process(self: &Rc<Self>, label: &str) -> Ctx {
-        let id = ProcessId::new(self.next_process.get());
-        self.next_process.set(id.get() + 1);
-        self.processes.borrow_mut().insert(id, label.into());
-        Ctx::new(self.clone(), id)
+    pub(crate) fn add_process(
+        self: &Rc<Self>,
+        machine: MachineId,
+        label: &str,
+        entry: EntryPoint,
+    ) -> Ctx {
+        let id = self.machines.add_process(machine, label, entry.clone());
+        self.start(id, &entry)
     }
 
-    fn label(&self, process: ProcessId) -> Rc<str> {
-        self.processes
-            .borrow()
-            .get(&process)
-            .cloned()
-            .expect("every task belongs to a process this world added")
+    /// Runs the entry point as the process's `main` task.
+    fn start(self: &Rc<Self>, process: ProcessId, entry: &EntryPoint) -> Ctx {
+        let ctx = Ctx::new(self.clone(), process);
+        ctx.spawn("main", Priority::Default, entry(ctx.clone()))
+            .detach();
+        ctx
+    }
+
+    /// Kills every process on `machine` and leaves it down, following the kill rules in
+    /// `basalt_env::backend`. Every future of those processes is dropped before this returns,
+    /// except that of a task killing its own machine, which [`poll`](Self::poll) drops as soon
+    /// as its current poll ends.
+    pub(crate) fn kill(&self, machine: MachineId, kind: KillType) {
+        self.machines.kill(machine, kind);
+        trace!(Info, "MachineKilled", machine = machine.get(), kind = kind);
+        self.reap();
+    }
+
+    /// Brings `machine` back up, after a `Crash` kill if it's up, and starts a new incarnation
+    /// of each of its processes.
+    pub(crate) fn reboot(self: &Rc<Self>, machine: MachineId) {
+        if self.machines.is_up(machine) {
+            self.kill(machine, KillType::Crash);
+        }
+        let starts = self.machines.reboot(machine);
+        trace!(Info, "MachineRebooted", machine = machine.get());
+        for (id, entry) in starts {
+            self.start(id, &entry);
+        }
+    }
+
+    /// Drops every task of every dead process, each under its own process's trace label, since
+    /// its `Drop` code acts for that process.
+    fn reap(&self) {
+        self.executor.drop_tasks(
+            |task| !self.machines.alive(task.process),
+            |runnable| {
+                let _label = self.label_as(runnable.metadata().process);
+                drop(runnable);
+            },
+        );
+    }
+
+    /// Labels trace events with `process` until the guard drops, even if a task panics.
+    fn label_as(&self, process: ProcessId) -> impl Drop + '_ {
+        struct Restore<'a>(&'a Cell<Option<ProcessId>>, Option<ProcessId>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        Restore(&self.polling, self.polling.replace(Some(process)))
     }
 
     pub(crate) fn unseed(&self) -> u64 {
@@ -154,16 +199,22 @@ impl SimWorld {
     }
 
     fn poll(&self, runnable: Runnable) {
-        /// Clears the polled process even if the task panics.
-        struct Polling<'a>(&'a Cell<Option<ProcessId>>);
-        impl Drop for Polling<'_> {
-            fn drop(&mut self) {
-                self.0.set(None);
-            }
+        let process = runnable.metadata().process;
+        // Defensive, as the design's run loop says: a kill already drops every queued runnable
+        // of its processes, and `async-task` never queues a dropped task again.
+        if !self.machines.alive(process) {
+            drop(runnable);
+            return;
         }
-        self.polling.set(Some(runnable.metadata().process));
-        let _polling = Polling(&self.polling);
-        runnable.run();
+        {
+            let _label = self.label_as(process);
+            runnable.run();
+        }
+        // A task that killed its own process was still running during the kill, so it may have
+        // been queued again just now. Drop it before any other task runs.
+        if !self.machines.alive(process) {
+            self.reap();
+        }
     }
 
     fn hang(&self) -> Hang {
@@ -175,7 +226,7 @@ impl SimWorld {
                 id: meta.id,
                 name: meta.name,
                 priority: meta.priority,
-                process: self.label(meta.process),
+                process: self.machines.label(meta.process),
             })
             .collect();
         Hang {
@@ -191,7 +242,11 @@ impl Backend for SimWorld {
     }
 
     fn start_task(&self, first: Runnable) {
+        let process = first.metadata().process;
         self.executor.start(first);
+        if !self.machines.alive(process) {
+            self.reap();
+        }
     }
 
     fn scheduler(&self) -> Scheduler {
@@ -206,40 +261,60 @@ impl Backend for SimWorld {
         self.executor.detach(task);
     }
 
-    fn now(&self, _: ProcessId) -> Instant {
-        self.clock.now()
+    fn now(&self, process: ProcessId) -> Instant {
+        self.machines.clock_of(process).now()
     }
 
     fn wall_clock(&self, process: ProcessId) -> SystemTime {
-        UNIX_EPOCH + WALL_CLOCK_START + Duration::from_nanos(self.now(process).as_nanos())
+        self.machines.clock_of(process).wall()
     }
 
-    fn sleep_until(&self, _: ProcessId, deadline: Instant) -> LocalBoxFuture<'static, ()> {
-        Box::pin(self.clock.sleep_until(deadline))
+    fn sleep_until(&self, process: ProcessId, deadline: Instant) -> LocalBoxFuture<'static, ()> {
+        if !self.machines.alive(process) {
+            return Box::pin(pending());
+        }
+        Box::pin(self.machines.clock_of(process).sleep_until(deadline))
     }
 
     fn rng(&self) -> &Rng {
         &self.streams.ctx
     }
 
-    fn listen(&self, _: ProcessId, _: u16) -> LocalBoxFuture<'_, io::Result<Box<dyn ListenerIo>>> {
-        Box::pin(async { Err(no_network()) })
+    fn listen(
+        &self,
+        process: ProcessId,
+        _: u16,
+    ) -> LocalBoxFuture<'_, io::Result<Box<dyn ListenerIo>>> {
+        let error = unavailable(&self.machines, process, "network");
+        Box::pin(async { Err(error) })
     }
 
     fn connect(
         &self,
-        _: ProcessId,
+        process: ProcessId,
         _: SocketAddr,
     ) -> LocalBoxFuture<'_, io::Result<Box<dyn StreamIo>>> {
-        Box::pin(async { Err(no_network()) })
+        let error = unavailable(&self.machines, process, "network");
+        Box::pin(async { Err(error) })
     }
 
-    fn disks(&self, _: ProcessId) -> Rc<[DiskId]> {
-        Rc::new([])
+    fn disks(&self, process: ProcessId) -> Rc<[DiskId]> {
+        self.machines.disks_of(process)
     }
 
     fn disk(&self, process: ProcessId, disk: DiskId) -> Rc<dyn DiskIo> {
-        panic!("{disk:?} is not a disk of {process:?}, which has none")
+        // A dead process may still hold the id of a disk its machine has since lost to a wipe.
+        if self.machines.alive(process) {
+            let disks = self.disks(process);
+            assert!(
+                disks.contains(&disk),
+                "{disk:?} is not a disk of {process:?}, which has {disks:?}"
+            );
+        }
+        Rc::new(NoDisk {
+            machines: self.machines.clone(),
+            process,
+        })
     }
 
     fn compute(
@@ -248,6 +323,9 @@ impl Backend for SimWorld {
         cost: Cost,
         job: ComputeJob,
     ) -> LocalBoxFuture<'_, ComputeOutput> {
+        if !self.machines.alive(process) {
+            return Box::pin(pending());
+        }
         let output = world::without(job);
         let done = self
             .now(process)
@@ -261,11 +339,64 @@ impl Backend for SimWorld {
     }
 }
 
-fn no_network() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the simulated network isn't built yet",
-    )
+/// The error for I/O through `process` on a part of the world not built yet, or the dead-process
+/// error once the process is dead.
+fn unavailable(machines: &Machines, process: ProcessId, what: &str) -> io::Error {
+    if machines.alive(process) {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("the simulated {what} isn't built yet"),
+        )
+    } else {
+        io::Error::other(format!("{process:?} is dead"))
+    }
+}
+
+/// Stands in for a disk until the simulated disk is built: every operation fails, with the
+/// dead-process error once its process is dead.
+struct NoDisk {
+    machines: Rc<Machines>,
+    process: ProcessId,
+}
+
+impl NoDisk {
+    fn fail<'a, T: 'a>(&self) -> LocalBoxFuture<'a, io::Result<T>> {
+        let error = unavailable(&self.machines, self.process, "disk");
+        Box::pin(async { Err(error) })
+    }
+}
+
+impl DiskIo for NoDisk {
+    fn open<'a>(
+        &'a self,
+        _: &'a str,
+        _: OpenOptions,
+    ) -> LocalBoxFuture<'a, io::Result<Box<dyn FileIo>>> {
+        self.fail()
+    }
+
+    fn rename<'a>(&'a self, _: &'a str, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
+        self.fail()
+    }
+
+    fn remove<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
+        self.fail()
+    }
+
+    fn list<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<Vec<String>>> {
+        self.fail()
+    }
+
+    fn sync_dir<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
+        self.fail()
+    }
+
+    fn space(&self) -> Space {
+        Space {
+            total: 0,
+            available: 0,
+        }
+    }
 }
 
 impl World for SimWorld {
@@ -281,7 +412,7 @@ impl World for SimWorld {
     fn probe(&self, _: &'static ProbeSite) {}
 
     fn trace(&self, event: &Event<'_>) {
-        let process = self.polling.get().map(|p| self.label(p));
+        let process = self.polling.get().map(|p| self.machines.label(p));
         self.trace.record(event, self.clock.now(), process);
     }
 

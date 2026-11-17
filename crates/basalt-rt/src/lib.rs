@@ -9,25 +9,10 @@
 //!
 //! # Disks
 //!
-//! Each disk is a directory on the host, from [`Config::disks`]. The `Disk` API has no
-//! `create_dir`, so directories are implicit, and `basalt-sim` follows the same rules:
-//!
-//! - A path is relative to the disk's root: non-empty components joined by `/`, with no `.` or
-//!   `..`. Anything else fails with `InvalidInput`. A directory argument may also be `""`, the
-//!   root.
-//! - Opening a file with `create` or `create_new`, or renaming a file, creates the missing
-//!   directories above it.
-//! - `sync_dir(d)` makes durable the creating, renaming, and removing of files directly in `d`,
-//!   and every directory on the path to `d`, including ones created above. Nothing else about
-//!   directories is durable before that. A rename between two directories needs `sync_dir` of
-//!   both. `sync_dir` of a directory that doesn't exist does nothing, since nothing in it can be
-//!   lost.
-//! - `list` returns the names of the files directly in a directory, sorted, without
-//!   subdirectories. A directory with no files lists as empty, whether or not it exists on the
-//!   host.
-//! - `remove` removes files only, and leaves empty directories behind.
-//! - A name is a file or a directory, never both. Opening, renaming, or removing a directory as
-//!   a file fails with `IsADirectory`, and a path through a file fails with `NotADirectory`.
+//! Each disk is a directory on the host, from [`Config::disks`], and each path maps to the file
+//! at that path under it. Paths and directories follow the rules every backend shares, in
+//! [`basalt_env::Disk`]'s docs: for example, a directory on the host with no files lists as
+//! empty, and `sync_dir` fsyncs the directory and every directory on the path to it.
 //!
 //! # Example
 //!

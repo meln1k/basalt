@@ -10,6 +10,9 @@ use std::task::{Poll, Waker};
 use basalt_env::{Cost, Ctx, Duration, Instant, Priority, Severity, trace};
 use basalt_sim::{Sim, SimError, TraceRecord};
 
+mod common;
+use common::process;
+
 /// What a run produced, to compare runs.
 #[derive(Debug, PartialEq)]
 struct Outcome {
@@ -25,11 +28,11 @@ struct Outcome {
 fn equal_priority_run(seed: u64, ctx_draws: usize) -> Outcome {
     let sim = Sim::new(seed);
     let order = Rc::new(RefCell::new(Vec::new()));
-    for process in ["a", "b"] {
-        let ctx = sim.control().add_process(process);
+    for label in ["a", "b"] {
+        let ctx = process(&sim, label);
         for i in 0..4 {
             let (o, c) = (order.clone(), ctx.clone());
-            let name = format!("{process}{i}");
+            let name = format!("{label}{i}");
             ctx.spawn("step", Priority::Default, async move {
                 for round in 1..=3u64 {
                     o.borrow_mut().push(name.clone());
@@ -67,7 +70,7 @@ fn the_same_seed_gives_the_same_trace_and_unseed() {
 fn the_unseed_covers_the_trace() {
     let unseed = |value: u32| {
         let sim = Sim::new(9);
-        let ctx = sim.control().add_process("p");
+        let ctx = process(&sim, "p");
         ctx.spawn("t", Priority::Default, async move {
             trace!(Info, "Value", value = value);
         })
@@ -133,7 +136,7 @@ fn drawing_from_ctx_rng_does_not_change_the_schedule() {
 fn higher_priorities_always_run_first() {
     for seed in 0..20 {
         let sim = Sim::new(seed);
-        let ctx = sim.control().add_process("p");
+        let ctx = process(&sim, "p");
         let ran = Rc::new(RefCell::new(Vec::new()));
         // Lowest first, so FIFO alone would get it backwards.
         for priority in Priority::ALL.iter().rev() {
@@ -169,8 +172,7 @@ async fn wait_for(flag: Rc<Cell<bool>>, waiter: Rc<RefCell<Option<Waker>>>) {
 #[test]
 fn a_deadlock_is_reported_with_the_blocked_tasks_names() {
     let sim = Sim::new(3);
-    let ctrl = sim.control();
-    let (a, b) = (ctrl.add_process("alpha"), ctrl.add_process("beta"));
+    let (a, b) = (process(&sim, "alpha"), process(&sim, "beta"));
     // Each waits for the other to go first.
     let (a_done, b_done) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
     let (a_waker, b_waker) = (Rc::default(), Rc::default());
@@ -201,8 +203,9 @@ fn a_deadlock_is_reported_with_the_blocked_tasks_names() {
         ]
     );
     let report = SimError::Hang(hang).to_string();
+    // Tasks 0 and 1 are the two processes' entry points.
     assert!(
-        report.contains("\"alpha-waits-for-beta\" on alpha (Coordination, task 0)"),
+        report.contains("\"alpha-waits-for-beta\" on alpha (Coordination, task 2)"),
         "{report}"
     );
 }
@@ -210,7 +213,7 @@ fn a_deadlock_is_reported_with_the_blocked_tasks_names() {
 /// Runs one task that traces a `severity` event at 1s and an `Info` one at 2s.
 fn trace_then_continue(severity: Severity) -> (Result<(), SimError>, Vec<TraceRecord>) {
     let sim = Sim::new(5);
-    let ctx = sim.control().add_process("p");
+    let ctx = process(&sim, "p");
     let (c, error) = (ctx.clone(), severity == Severity::Error);
     ctx.spawn("t", Priority::Default, async move {
         c.sleep(Duration::from_secs(1)).await;
@@ -262,7 +265,7 @@ fn an_error_trace_outside_any_task_fails_the_next_run() {
 #[allow(clippy::disallowed_methods)]
 fn a_wake_from_another_thread_trips_the_assertion() {
     let sim = Sim::new(0);
-    let ctx = sim.control().add_process("p");
+    let ctx = process(&sim, "p");
     let waker: Arc<Mutex<Option<Waker>>> = Arc::default();
     let w = waker.clone();
     ctx.spawn("woken-elsewhere", Priority::Default, async move {
@@ -292,7 +295,7 @@ fn timers_fire_at_their_deadline_or_slightly_later() {
     let late = Rc::new(Cell::new(0));
     for seed in 0..20 {
         let sim = Sim::new(seed);
-        let ctx = sim.control().add_process("p");
+        let ctx = process(&sim, "p");
         for _ in 0..5 {
             let (c, l) = (ctx.clone(), late.clone());
             ctx.spawn("sleeper", Priority::Default, async move {
@@ -319,7 +322,7 @@ fn timers_fire_at_their_deadline_or_slightly_later() {
 #[test]
 fn timeout_returns_elapsed_when_the_deadline_passes_first() {
     let sim = Sim::new(0);
-    let ctx = sim.control().add_process("p");
+    let ctx = process(&sim, "p");
     let c = ctx.clone();
     let task = ctx.spawn("t", Priority::Default, async move {
         let slow = c.timeout(Duration::from_secs(1), pending::<()>()).await;
@@ -336,7 +339,7 @@ fn timeout_returns_elapsed_when_the_deadline_passes_first() {
 #[test]
 fn block_on_returns_while_other_tasks_still_run() {
     let sim = Sim::new(0);
-    let ctx = sim.control().add_process("p");
+    let ctx = process(&sim, "p");
     let c = ctx.clone();
     ctx.spawn("server", Priority::Default, async move {
         loop {
@@ -365,7 +368,7 @@ fn compute_in(ctx: &Ctx) -> impl Future<Output = (bool, bool, Instant)> + use<> 
 #[test]
 fn compute_runs_with_no_world_and_charges_its_cost() {
     let sim = Sim::new(0);
-    let ctx = sim.control().add_process("p");
+    let ctx = process(&sim, "p");
     let task = ctx.spawn("compute", Priority::Default, compute_in(&ctx));
     let (inside, after, now) = sim.block_on(task).unwrap();
     assert!(!inside, "the job sees no world");
@@ -386,7 +389,7 @@ fn dropping_a_sim_drops_every_task_left() {
     let held;
     {
         let sim = Sim::new(0);
-        let ctx = sim.control().add_process("p");
+        let ctx = process(&sim, "p");
         let flag = DropFlag(parked.clone());
         held = ctx.spawn("parked", Priority::Default, async move {
             let _flag = flag;

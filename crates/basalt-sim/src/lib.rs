@@ -5,10 +5,16 @@
 //! ready task of the highest priority, and when none is ready, jump virtual time to the next
 //! timer. [`SimControl`] is the handle tests and fault workloads use to shape the world.
 //!
+//! Processes run on machines, each with a failure zone, disks, and its own drifting clocks. A
+//! process is an entry point that reruns as a new incarnation, with a fresh `ProcessId`, each
+//! time its machine reboots. Killing a machine drops every future of its processes at once, by
+//! the kill and dead-process rules in `basalt_env::backend`.
+//!
 //! A run fails when no task can make progress ([`SimError::Hang`]) or when any code records an
 //! `Error` trace event ([`SimError::ErrorTrace`]). A panic in a task propagates out of the run.
 
 mod executor;
+mod machine;
 mod time;
 mod trace;
 mod world;
@@ -20,9 +26,11 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use basalt_env::backend::LocalBoxFuture;
 use basalt_env::world::WorldGuard;
-use basalt_env::{Ctx, Instant, Priority, Task, TaskId};
+use basalt_env::{Ctx, Instant, Priority, SystemTime, Task, TaskId};
 
+pub use crate::machine::{KillType, MachineId};
 pub use crate::trace::TraceRecord;
 use crate::world::SimWorld;
 
@@ -94,7 +102,7 @@ impl Sim {
 impl Drop for Sim {
     fn drop(&mut self) {
         // While the world is still installed, in case some `Drop` code traces.
-        self.world.executor.drop_tasks(|_| true);
+        self.world.executor.drop_tasks(|_| true, drop);
     }
 }
 
@@ -106,17 +114,79 @@ impl fmt::Debug for Sim {
     }
 }
 
-/// Shapes a running simulation: adds processes now, and kills, clock skew, network and disk
-/// faults as later tasks add them. It lives in `basalt-sim`, so production code can't reach it.
+/// Shapes a running simulation: adds machines and processes, kills and reboots machines, and
+/// skews their clocks. Network and disk faults come with the simulated network and disks. It
+/// lives in `basalt-sim`, so production code can't reach it.
+///
+/// Every method may be called from inside a task, including one on the machine it kills.
 #[derive(Clone)]
 pub struct SimControl {
     world: Rc<SimWorld>,
 }
 
 impl SimControl {
-    /// Adds a process and returns its `Ctx`. `label` names it in traces and hang reports.
-    pub fn add_process(&self, label: &str) -> Ctx {
-        self.world.add_process(label)
+    /// Adds a running machine in failure zone `zone` with `disks` disks. Its clocks start with
+    /// no drift, and its wall clock at 2026-01-01T00:00:00Z.
+    pub fn add_machine(&self, zone: &str, disks: usize) -> MachineId {
+        self.world.machines.add_machine(zone, disks)
+    }
+
+    /// Adds a process to a running machine and starts it: `entry` runs as the process's `main`
+    /// task, and runs again with a new `Ctx` each time the machine reboots. Returns this first
+    /// incarnation's `Ctx`. `label` names the process in traces and hang reports.
+    pub fn add_process(
+        &self,
+        machine: MachineId,
+        label: &str,
+        entry: impl Fn(Ctx) -> LocalBoxFuture<'static, ()> + 'static,
+    ) -> Ctx {
+        self.world.add_process(machine, label, Rc::new(entry))
+    }
+
+    /// Kills every process on `machine` and leaves the machine down until
+    /// [`reboot`](SimControl::reboot). Every future of those processes is dropped before this
+    /// returns, and their `Ctx`s stay dead. The one exception is a task killing its own
+    /// machine: it is dropped as soon as its current poll ends, before any other task runs.
+    /// Killing a machine that's down applies only what `kind` does to its disks.
+    pub fn kill(&self, machine: MachineId, kind: KillType) {
+        self.world.kill(machine, kind);
+    }
+
+    /// Starts a new incarnation of each process on `machine`, with a fresh `ProcessId`, by
+    /// rerunning its entry point. A machine that's up is first killed with
+    /// [`KillType::Crash`].
+    pub fn reboot(&self, machine: MachineId) {
+        self.world.reboot(machine);
+    }
+
+    /// Whether `machine` is running, rather than killed and not yet rebooted.
+    pub fn is_up(&self, machine: MachineId) -> bool {
+        self.world.machines.is_up(machine)
+    }
+
+    /// The failure zone `machine` was added in.
+    pub fn zone(&self, machine: MachineId) -> Rc<str> {
+        self.world.machines.zone(machine)
+    }
+
+    /// Skews `machine`'s clocks: from now on its monotonic clock, and the wall clock that
+    /// follows it, run `ppm` parts per million faster than virtual time, or slower if
+    /// negative. Its readings stay continuous. Panics unless `ppm` is within ±999,999.
+    ///
+    /// Timers already set on the machine move to the new rate.
+    pub fn set_clock_drift(&self, machine: MachineId, ppm: i32) {
+        self.world.machines.clock(machine).set_drift(ppm);
+    }
+
+    /// Jumps `machine`'s wall clock, forward or back, so that it reads `to` now. Its monotonic
+    /// clock is unchanged.
+    pub fn set_wall_clock(&self, machine: MachineId, to: SystemTime) {
+        self.world.machines.clock(machine).set_wall(to);
+    }
+
+    /// What `machine`'s wall clock reads now.
+    pub fn wall_clock(&self, machine: MachineId) -> SystemTime {
+        self.world.machines.clock(machine).wall()
     }
 
     /// The current virtual time.
