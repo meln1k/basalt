@@ -223,6 +223,14 @@ impl SimControl {
         );
     }
 
+    /// Like [`refuse_if_protected`](SimControl::refuse_if_protected), for the machine that has
+    /// `disk`. A disk no machine has is left for the fault itself to reject.
+    fn refuse_disk_if_protected(&self, disk: DiskId, fault: &str) {
+        if let Some(machine) = self.world.machines.disk_owner(disk) {
+            self.refuse_if_protected(machine, fault);
+        }
+    }
+
     /// The disks of `machine` right now. A [`KillType::Wipe`] replaces them with new ones, and a
     /// [`KillType::DiskFail`] leaves none.
     pub fn disks(&self, machine: MachineId) -> Rc<[DiskId]> {
@@ -232,22 +240,27 @@ impl SimControl {
     /// Fills `disk`: until [`restore_disks`](SimControl::restore_disks), creating a file and
     /// anything that makes a file longer fail with `StorageFull` (`ENOSPC`), and
     /// [`Disk::space`](basalt_env::Disk::space) reports nothing available. Panics if no machine
-    /// has `disk`.
+    /// has `disk`, or if its machine is [protected](SimControl::protect).
     pub fn fill_disk(&self, disk: DiskId) {
+        self.refuse_disk_if_protected(disk, "fill_disk");
         self.world.disks.fill(disk);
     }
 
     /// Makes each read and write on `disk` fail with `EIO` with probability `p`, until
     /// [`restore_disks`](SimControl::restore_disks). A failed write changes nothing. Panics if
-    /// no machine has `disk`, or unless `0 <= p <= 1`.
+    /// no machine has `disk`, if its machine is [protected](SimControl::protect), or unless
+    /// `0 <= p <= 1`.
     pub fn set_disk_errors(&self, disk: DiskId, p: f64) {
+        self.refuse_disk_if_protected(disk, "set_disk_errors");
         self.world.disks.set_io_errors(disk, p);
     }
 
     /// Makes each read on `disk` return one flipped bit with probability `p`, until
     /// [`restore_disks`](SimControl::restore_disks). The data on the disk stays intact. Panics
-    /// if no machine has `disk`, or unless `0 <= p <= 1`.
+    /// if no machine has `disk`, if its machine is [protected](SimControl::protect), or unless
+    /// `0 <= p <= 1`.
     pub fn set_bit_flips(&self, disk: DiskId, p: f64) {
+        self.refuse_disk_if_protected(disk, "set_bit_flips");
         self.world.disks.set_bit_flips(disk, p);
     }
 

@@ -218,10 +218,14 @@ impl Machines {
 
     /// Whether some machine has `disk` now.
     pub(crate) fn has_disk(&self, disk: DiskId) -> bool {
-        self.machines
-            .borrow()
-            .iter()
-            .any(|m| m.disks.contains(&disk))
+        self.disk_owner(disk).is_some()
+    }
+
+    /// The machine that has `disk` now, if any.
+    pub(crate) fn disk_owner(&self, disk: DiskId) -> Option<MachineId> {
+        let machines = self.machines.borrow();
+        let index = machines.iter().position(|m| m.disks.contains(&disk))?;
+        Some(MachineId(u32::try_from(index).expect("too many machines")))
     }
 
     pub(crate) fn alive(&self, process: ProcessId) -> bool {
