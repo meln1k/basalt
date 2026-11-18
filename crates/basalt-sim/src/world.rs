@@ -1,7 +1,8 @@
 //! The simulated world: the run loop, and the `Backend` and ambient `World` it implements by
 //! delegating to the executor, the clock, and the trace.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::future::pending;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -9,18 +10,20 @@ use std::rc::Rc;
 
 use basalt_env::backend::{
     Backend, ComputeJob, ComputeOutput, DetachedTask, DiskIo, ListenerIo, LocalBoxFuture, Runnable,
-    Scheduler, StreamIo,
+    Scheduler, StreamIo, TaskMeta,
 };
 use basalt_env::world::{self, BuggifySite, Event, ProbeSite, World};
 use basalt_env::{
     Cost, Ctx, DiskId, Duration, Instant, Knobs, Priority, ProcessId, Rng, SocketAddr, SystemTime,
-    TaskId, trace,
+    TaskId, buggify, trace,
 };
 
+use crate::buggify::{Buggify, Coverage};
 use crate::disk::Disks;
 use crate::executor::Executor;
 use crate::machine::{EntryPoint, KillType, MachineId, Machines};
 use crate::net::Net;
+use crate::swarm::Swarm;
 use crate::time::Clock;
 use crate::trace::TraceLog;
 use crate::{BlockedTask, Hang, SimError};
@@ -29,6 +32,10 @@ use crate::{BlockedTask, Hang, SimError};
 /// late, never early, so code must not depend on exactly when they fire.
 const LATE_TIMER_PROBABILITY: f64 = 0.01;
 const MAX_TIMER_LATENESS: Duration = Duration::from_millis(1);
+
+/// How often the random-cancel `buggify!` site fires, when switched on, each time the run loop
+/// is about to move time forward. Rare, since every cancel is a fault the code must survive.
+const CANCEL_PROBABILITY: f64 = 0.001;
 
 /// The run's seed split into one stream per concern (design doc, "Randomness"). Each draw
 /// belongs to exactly one stream, so drawing more from one never shifts the others.
@@ -87,12 +94,19 @@ pub(crate) struct SimWorld {
     pub(crate) disks: Rc<Disks>,
     /// The process whose task is being polled or dropped, for trace labels.
     polling: Cell<Option<ProcessId>>,
+    buggify: Buggify,
+    /// The live task of each process that runs its entry point. The random-cancel site
+    /// spares them.
+    main_tasks: RefCell<BTreeSet<TaskId>>,
+    pub(crate) swarm: Swarm,
     knobs: Rc<Knobs>,
 }
 
 impl SimWorld {
     pub(crate) fn new(seed: u64) -> SimWorld {
         let streams = Streams::new(seed);
+        let mut knobs = Knobs::default();
+        let swarm = Swarm::draw(&streams.faults, &mut knobs);
         let shuffle = streams.scheduler.bool(0.5);
         let clock = Rc::<Clock>::default();
         let machines = Rc::new(Machines::new(clock.clone()));
@@ -116,7 +130,10 @@ impl SimWorld {
             executor: Executor::new(shuffle),
             trace: TraceLog::new(),
             polling: Cell::new(None),
-            knobs: Rc::default(),
+            buggify: Buggify::default(),
+            main_tasks: RefCell::default(),
+            swarm,
+            knobs: Rc::new(knobs),
         }
     }
 
@@ -133,8 +150,9 @@ impl SimWorld {
     /// Runs the entry point as the process's `main` task.
     fn start(self: &Rc<Self>, process: ProcessId, entry: &EntryPoint) -> Ctx {
         let ctx = Ctx::new(self.clone(), process);
-        ctx.spawn("main", Priority::Default, entry(ctx.clone()))
-            .detach();
+        let main = ctx.spawn("main", Priority::Default, entry(ctx.clone()));
+        self.main_tasks.borrow_mut().insert(main.id());
+        main.detach();
         ctx
     }
 
@@ -168,10 +186,11 @@ impl SimWorld {
         }
     }
 
-    /// Lifts every fault: heals the network, clears every disk fault, stops every clock's
-    /// drift, and reboots every machine that's down. The network and disks recover first, so
-    /// rebooted processes start on them healed.
+    /// Lifts every fault: turns BUGGIFY off for the rest of the run, heals the network, clears
+    /// every disk fault, stops every clock's drift, and reboots every machine that's down. The
+    /// network and disks recover first, so rebooted processes start on them healed.
     pub(crate) fn lift_faults(self: &Rc<Self>) {
+        self.buggify.lift();
         self.net.heal();
         self.disks.restore();
         for machine in self.machines.ids() {
@@ -190,13 +209,16 @@ impl SimWorld {
     /// Drops every task of every dead process, each under its own process's trace label, since
     /// its `Drop` code acts for that process.
     fn reap(&self) {
-        self.executor.drop_tasks(
-            |task| !self.machines.alive(task.process),
-            |runnable| {
-                let _label = self.label_as(runnable.metadata().process);
-                drop(runnable);
-            },
-        );
+        self.drop_tasks(|task| !self.machines.alive(task.process));
+    }
+
+    /// Drops the future of every task `doomed` picks, each under its own process's trace label,
+    /// since its `Drop` code acts for that process.
+    fn drop_tasks(&self, doomed: impl Fn(&TaskMeta) -> bool) {
+        self.executor.drop_tasks(doomed, |runnable| {
+            let _label = self.label_as(runnable.metadata().process);
+            drop(runnable);
+        });
     }
 
     /// Labels trace events with `process` until the guard drops, even if a task panics.
@@ -208,6 +230,44 @@ impl SimWorld {
             }
         }
         Restore(&self.polling, self.polling.replace(Some(process)))
+    }
+
+    /// The random-cancel site (design doc, "Risks"): drops the future of one detached task,
+    /// picked from the `buggify` stream, as dropping its handle would have. It catches code
+    /// that assumes work after an `.await` always completes. Only detached tasks are picked,
+    /// because a task whose handle someone awaits can only vanish when its process dies, and
+    /// a kill already covers that. A process's main task and every task on a protected
+    /// machine are spared, since without them a process or the run itself stops doing
+    /// anything at all. Returns whether it cancelled a task.
+    fn cancel_random_task(&self) -> bool {
+        let mut tasks = self.executor.detached_tasks();
+        let main_tasks = self.main_tasks.borrow();
+        tasks.retain(|t| {
+            !main_tasks.contains(&t.id)
+                && !self
+                    .machines
+                    .is_protected(self.machines.machine_of(t.process))
+        });
+        drop(main_tasks);
+        if tasks.is_empty() {
+            return false;
+        }
+        let victim = tasks[self.streams.buggify.range(0..tasks.len())];
+        {
+            let _label = self.label_as(victim.process);
+            trace!(
+                Info,
+                "TaskCancelled",
+                task = victim.id.get(),
+                name = victim.name
+            );
+        }
+        self.drop_tasks(|task| task.id == victim.id);
+        true
+    }
+
+    pub(crate) fn coverage(&self) -> Coverage {
+        self.buggify.coverage()
     }
 
     pub(crate) fn unseed(&self) -> u64 {
@@ -234,6 +294,10 @@ impl SimWorld {
             let Some(next) = self.clock.next_deadline() else {
                 return Err(SimError::Hang(self.hang()));
             };
+            // Between bursts of work, now and then, rather than on every poll.
+            if buggify!(CANCEL_PROBABILITY) && self.cancel_random_task() {
+                continue;
+            }
             let rng = &self.streams.scheduler;
             let mut to = next;
             if rng.bool(LATE_TIMER_PROBABILITY) {
@@ -301,6 +365,7 @@ impl Backend for SimWorld {
     }
 
     fn task_ended(&self, task: TaskId) {
+        self.main_tasks.borrow_mut().remove(&task);
         self.executor.ended(task);
     }
 
@@ -319,6 +384,15 @@ impl Backend for SimWorld {
     fn sleep_until(&self, process: ProcessId, deadline: Instant) -> LocalBoxFuture<'static, ()> {
         if !self.machines.alive(process) {
             return Box::pin(pending());
+        }
+        let mut deadline = deadline;
+        // Timers may fire late, never early, as in FoundationDB's `delay`.
+        if deadline != Instant::MAX && buggify!() {
+            let extra = self
+                .streams
+                .buggify
+                .range(Duration::ZERO..=self.knobs.max_buggified_delay);
+            deadline = deadline.checked_add(extra).unwrap_or(Instant::MAX);
         }
         Box::pin(self.machines.clock_of(process).sleep_until(deadline))
     }
@@ -387,12 +461,13 @@ impl World for SimWorld {
         true
     }
 
-    fn buggify(&self, _: &'static BuggifySite, _: f64) -> bool {
-        // Site switches and firing come with T10.
-        false
+    fn buggify(&self, site: &'static BuggifySite, fire: f64) -> bool {
+        self.buggify.fires(site, fire, &self.streams.buggify)
     }
 
-    fn probe(&self, _: &'static ProbeSite) {}
+    fn probe(&self, site: &'static ProbeSite) {
+        self.buggify.probe(site);
+    }
 
     fn trace(&self, event: &Event<'_>) {
         let process = self.polling.get().map(|p| self.machines.label(p));

@@ -236,6 +236,8 @@ fn a_task_killing_its_own_machine_is_dropped_before_any_other_task_runs() {
     for seed in 0..10 {
         let sim = Sim::new(seed);
         let ctrl = sim.control();
+        // Turns BUGGIFY off, so the spinner's sleeps end on time and it isn't cancelled.
+        ctrl.lift_faults();
         let a = ctrl.add_machine("zone-a", 0);
         let state = Rc::new(SelfKill::default());
         let (st, ctrl2) = (state.clone(), ctrl.clone());

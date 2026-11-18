@@ -724,9 +724,11 @@ fn a_closed_peer_resets_once_the_data_reaches_it() {
                 ctrl.partition(b, a);
                 c.write_all(b"x").await.unwrap();
                 let start = client.now();
+                let mut healed = start;
                 if let Some(d) = heal_after {
                     client.sleep(d).await;
                     ctrl.heal_network();
+                    healed = client.now();
                 }
                 let err = loop {
                     if let Err(e) = c.write(&[0; 4096]).await {
@@ -735,12 +737,18 @@ fn a_closed_peer_resets_once_the_data_reaches_it() {
                     client.sleep(Duration::from_millis(10)).await;
                 };
                 assert_eq!(err.kind(), ErrorKind::ConnectionReset);
-                let after = client.now() - start;
-                let expected = match heal_after {
+                let (after, expected) = match heal_after {
                     // Only the stall timeout resets the connection.
-                    None => Duration::from_secs(5)..Duration::from_secs(31),
-                    // The data arrives at the heal, and the reset a latency later.
-                    Some(d) => d..d + FAST,
+                    None => (
+                        client.now() - start,
+                        Duration::from_secs(5)..Duration::from_secs(31),
+                    ),
+                    // The data arrives at the heal, and the reset a latency later. BUGGIFY may
+                    // delay the sleep that notices it.
+                    Some(_) => (
+                        client.now() - healed,
+                        Duration::ZERO..FAST + basalt_env::knobs().max_buggified_delay,
+                    ),
                 };
                 assert!(
                     expected.contains(&after),

@@ -6,7 +6,7 @@ use std::task::Poll;
 
 use basalt_env::backend::LocalBoxFuture;
 use basalt_env::{Ctx, Duration, Priority, trace};
-use basalt_sim::{Sim, SimControl, SimError, TraceRecord};
+use basalt_sim::{Coverage, Sim, SimControl, SimError, TraceRecord};
 
 use crate::panic_hook;
 use crate::workload::{DynWorkload, TestSpec, WorkloadResult};
@@ -28,6 +28,8 @@ pub struct RunReport {
     /// A hash of every random stream's state and of the trace. Running the same seed on the
     /// same build must give the same unseed.
     pub unseed: u64,
+    /// The `buggify!` sites and probes the run reached.
+    pub coverage: Coverage,
 }
 
 /// Why a run failed. A panic doesn't get here: the panic hook prints the seed and aborts.
@@ -79,6 +81,15 @@ pub fn run(spec: &TestSpec, seed: u64, on_trace: impl FnMut(&TraceRecord) + 'sta
     let sim = Sim::new(seed);
     sim.on_trace(on_trace);
     let control = sim.control();
+    // Here rather than in `Sim::new`, so the sink above prints it.
+    let swarm = control.swarm();
+    trace!(
+        Info,
+        "Swarm",
+        faults = swarm.faults(),
+        randomized_knobs = swarm.randomized_knobs(),
+        knobs = basalt_env::knobs()
+    );
     // Before the test adds anything, so `machines()` never lists it, in `build` or later.
     let machine = control.add_machine(HARNESS, 0);
     control.protect(machine);
@@ -95,6 +106,7 @@ pub fn run(spec: &TestSpec, seed: u64, on_trace: impl FnMut(&TraceRecord) + 'sta
         seed,
         result,
         unseed: sim.unseed(),
+        coverage: sim.coverage(),
     }
 }
 

@@ -15,10 +15,13 @@
 //! on a fresh line:
 //!
 //! ```text
-//! basalt-sweep pass <seed> <unseed>
-//! basalt-sweep fail <seed> <unseed> <bytes>
+//! basalt-sweep pass <seed> <unseed> <coverage>
+//! basalt-sweep fail <seed> <unseed> <coverage> <bytes>
 //! <the failure text, exactly <bytes> bytes long>
 //! ```
+//!
+//! `<coverage>` is the `buggify!` sites and probes the run reached, as
+//! the coverage module encodes it.
 //!
 //! The parent skips every other line, so a stray `println!` in a test can't desync it.
 
@@ -41,6 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::coverage::{self, SweepCoverage};
 use crate::runner;
 use crate::workload::TestSpec;
 
@@ -67,6 +71,8 @@ pub struct SweepReport {
     /// Children that misbehaved outside any seed, such as by exiting with an error after their
     /// last one.
     pub worker_errors: Vec<String>,
+    /// What every seed that finished its run reached, between them.
+    pub coverage: SweepCoverage,
 }
 
 impl SweepReport {
@@ -110,17 +116,23 @@ pub fn sweep(
                             Err(e) => Err(format!("can't start a sweep worker: {e}")),
                         },
                     };
-                    let result = result.unwrap_or_else(|why| SeedResult {
-                        unseed: None,
-                        failure: Some(match worker.take() {
+                    let (result, coverage) = result.unwrap_or_else(|why| {
+                        let failure = match worker.take() {
                             Some(w) => w.stop(&why),
                             None => why,
-                        }),
+                        };
+                        let result = SeedResult {
+                            unseed: None,
+                            failure: Some(failure),
+                        };
+                        (result, SweepCoverage::default())
                     });
                     if let Some(why) = &result.failure {
                         on_failure(seed, why);
                     }
-                    report.lock().unwrap().seeds.insert(seed, result);
+                    let mut report = report.lock().unwrap();
+                    report.seeds.insert(seed, result);
+                    report.coverage.merge(coverage);
                 }
                 if let Some(error) = worker.and_then(Worker::finish) {
                     report.lock().unwrap().worker_errors.push(error);
@@ -146,6 +158,7 @@ struct Worker {
 struct Reply {
     seed: u64,
     unseed: u64,
+    coverage: String,
     failure: Option<String>,
 }
 
@@ -194,17 +207,27 @@ impl Worker {
         })
     }
 
-    /// Runs `seed`. Returns why not if the child died, garbled its answer, or took longer than
-    /// `timeout`; the child is then of no further use.
-    fn run(&mut self, seed: u64, timeout: Duration) -> Result<SeedResult, String> {
+    /// Runs `seed`, and returns how it ended and what it reached. Returns why not if the child
+    /// died, garbled its answer, or took longer than `timeout`; the child is then of no further
+    /// use.
+    fn run(&mut self, seed: u64, timeout: Duration) -> Result<(SeedResult, SweepCoverage), String> {
         writeln!(self.stdin, "{seed}")
             .and_then(|()| self.stdin.flush())
             .map_err(|e| format!("couldn't send the seed to the child process: {e}"))?;
         match self.replies.recv_timeout(timeout) {
-            Ok(Ok(reply)) if reply.seed == seed => Ok(SeedResult {
-                unseed: Some(reply.unseed),
-                failure: reply.failure,
-            }),
+            Ok(Ok(reply)) if reply.seed == seed => {
+                let coverage = coverage::decode(&reply.coverage).ok_or_else(|| {
+                    format!(
+                        "the child process garbled its coverage: {:?}",
+                        reply.coverage
+                    )
+                })?;
+                let result = SeedResult {
+                    unseed: Some(reply.unseed),
+                    failure: reply.failure,
+                };
+                Ok((result, coverage))
+            }
             Ok(Ok(reply)) => Err(format!(
                 "the child process answered for seed {} instead",
                 reply.seed
@@ -294,17 +317,19 @@ fn next_reply(out: &mut impl BufRead) -> io::Result<Option<Reply>> {
         };
         let num = |word: &str| word.parse::<u64>().map_err(|_| bad());
         let reply = match words[1..] {
-            ["pass", seed, unseed] => Reply {
+            ["pass", seed, unseed, coverage] => Reply {
                 seed: num(seed)?,
                 unseed: num(unseed)?,
+                coverage: coverage.to_owned(),
                 failure: None,
             },
-            ["fail", seed, unseed, bytes] => {
+            ["fail", seed, unseed, coverage, bytes] => {
                 let mut text = vec![0; usize::try_from(num(bytes)?).map_err(|_| bad())?];
                 out.read_exact(&mut text)?;
                 Reply {
                     seed: num(seed)?,
                     unseed: num(unseed)?,
+                    coverage: coverage.to_owned(),
                     failure: Some(String::from_utf8_lossy(&text).into_owned()),
                 }
             }
@@ -327,13 +352,18 @@ pub fn worker(spec: &TestSpec) -> io::Result<()> {
         eprintln!("{TAG} seed {seed}");
         let report = runner::run(spec, seed, |_| ());
         let unseed = report.unseed;
+        let coverage = coverage::encode(&report.coverage);
         let mut out = io::stdout().lock();
         // Each result starts on a fresh line, even after stray output without a newline.
         match report.result {
-            Ok(()) => write!(out, "\n{TAG} pass {seed} {unseed}\n")?,
+            Ok(()) => write!(out, "\n{TAG} pass {seed} {unseed} {coverage}\n")?,
             Err(failure) => {
                 let text = failure.to_string();
-                write!(out, "\n{TAG} fail {seed} {unseed} {}\n{text}", text.len())?;
+                write!(
+                    out,
+                    "\n{TAG} fail {seed} {unseed} {coverage} {}\n{text}",
+                    text.len()
+                )?;
             }
         }
         out.flush()?;
@@ -347,30 +377,36 @@ mod tests {
 
     #[test]
     fn results_are_read_past_stray_output_and_keep_their_text() {
-        let failure = "line one\nbasalt-sweep pass 9 9\n";
+        let failure = "line one\nbasalt-sweep pass 9 9 ;;\n";
         let out = format!(
-            "stray\n\n{TAG} pass 3 30\nno newline\n{TAG} fail 4 40 {}\n{failure}\nmore stray\n",
+            "stray\n\n{TAG} pass 3 30 0,1;1;\nno newline\n{TAG} fail 4 40 ;; {}\n{failure}\nmore stray\n",
             failure.len()
         );
         let mut out = out.as_bytes();
-        let reply = |seed, unseed, failure: Option<&str>| Reply {
+        let reply = |seed, unseed, coverage: &str, failure: Option<&str>| Reply {
             seed,
             unseed,
+            coverage: coverage.to_owned(),
             failure: failure.map(str::to_owned),
         };
-        assert_eq!(next_reply(&mut out).unwrap(), Some(reply(3, 30, None)));
         assert_eq!(
             next_reply(&mut out).unwrap(),
-            Some(reply(4, 40, Some(failure)))
+            Some(reply(3, 30, "0,1;1;", None))
+        );
+        assert_eq!(
+            next_reply(&mut out).unwrap(),
+            Some(reply(4, 40, ";;", Some(failure)))
         );
         assert_eq!(next_reply(&mut out).unwrap(), None);
     }
 
     #[test]
     fn a_garbled_result_is_an_error() {
-        let mut out = format!("{TAG} pass three 30\n").into_bytes();
+        let mut out = format!("{TAG} pass three 30 ;;\n").into_bytes();
         assert!(next_reply(&mut out.as_slice()).is_err());
-        out = format!("{TAG} fail 4 40 100\nshort").into_bytes();
+        out = format!("{TAG} pass 3 30\n").into_bytes();
+        assert!(next_reply(&mut out.as_slice()).is_err());
+        out = format!("{TAG} fail 4 40 ;; 100\nshort").into_bytes();
         assert!(next_reply(&mut out.as_slice()).is_err());
     }
 }

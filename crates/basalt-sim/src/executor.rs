@@ -98,6 +98,17 @@ impl Executor {
         self.tasks.borrow().values().map(|t| t.meta).collect()
     }
 
+    /// Every live task that its process owns, because it was detached, by id. Nobody awaits
+    /// these, so dropping one looks to the rest of the world like dropping its handle.
+    pub(crate) fn detached_tasks(&self) -> Vec<TaskMeta> {
+        self.tasks
+            .borrow()
+            .values()
+            .filter(|t| t.detached.is_some())
+            .map(|t| t.meta)
+            .collect()
+    }
+
     /// Takes the next runnable: highest priority first, then FIFO or a pick drawn from `rng`.
     pub(crate) fn pop_ready(&self, rng: &Rng) -> Option<Runnable> {
         let mut ready = self.ready.lock().unwrap();

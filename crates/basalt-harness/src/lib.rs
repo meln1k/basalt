@@ -1,4 +1,4 @@
-//! Workloads, test specs, the seed runner and sweep, checkers, and swarm configs.
+//! Workloads, test specs, the seed runner and sweep with its coverage report, and checkers.
 //!
 //! A test is a [`TestSpec`]: a function that builds the simulated system and returns its
 //! [`Workload`]s. [`runner::run`] takes one test and one seed through setup, the chaos phase,
@@ -7,6 +7,7 @@
 
 pub mod checker;
 pub mod cli;
+pub mod coverage;
 mod history;
 pub mod panic_hook;
 pub mod runner;

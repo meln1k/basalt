@@ -18,13 +18,24 @@
 //! for each operation by an IOPS and bandwidth model. Every disk fault, power-cut outcome, and
 //! latency draws from the `disk` stream.
 //!
+//! BUGGIFY switches each `buggify!` site on for a run with probability
+//! [`BUGGIFY_SWITCH_PROBABILITY`], drawn from the `buggify` stream, and a switched-on site fires
+//! with its own probability, until [`SimControl::lift_faults`] turns BUGGIFY off for the quiet
+//! phase. The simulator has two sites of its own: one makes a `sleep` end up
+//! to the `max_buggified_delay` knob late, and one now and then cancels a random detached task,
+//! except a process's main task and tasks on protected machines. [`Sim::coverage`] reports which sites
+//! and probes a run reached. Each seed's [`Swarm`] config, drawn from the `faults` stream,
+//! enables a subset of fault types and randomizes a subset of knobs.
+//!
 //! A run fails when no task can make progress ([`SimError::Hang`]) or when any code records an
 //! `Error` trace event ([`SimError::ErrorTrace`]). A panic in a task propagates out of the run.
 
+mod buggify;
 mod disk;
 mod executor;
 mod machine;
 mod net;
+mod swarm;
 mod time;
 mod trace;
 mod world;
@@ -42,7 +53,9 @@ use basalt_env::{
     Ctx, DiskId, Duration, Instant, IpAddr, Priority, SystemTime, Task, TaskId, trace,
 };
 
+pub use crate::buggify::{BUGGIFY_SWITCH_PROBABILITY, Coverage, SiteHits};
 pub use crate::machine::{KillType, MachineId};
+pub use crate::swarm::{Fault, Swarm};
 pub use crate::trace::TraceRecord;
 use crate::world::SimWorld;
 
@@ -108,6 +121,11 @@ impl Sim {
     /// as it happens, so a panic doesn't lose it. Replaces any earlier sink.
     pub fn on_trace(&self, sink: impl FnMut(&TraceRecord) + 'static) {
         self.world.trace.set_sink(Box::new(sink));
+    }
+
+    /// How often each `buggify!` site and `probe!` was reached so far.
+    pub fn coverage(&self) -> Coverage {
+        self.world.coverage()
     }
 
     /// A hash of every random stream's state and of the trace so far. Running a seed twice on
@@ -203,11 +221,18 @@ impl SimControl {
     /// Lifts every fault, for a test's quiet phase: heals the network as
     /// [`heal_network`](SimControl::heal_network) does, clears every disk fault as
     /// [`restore_disks`](SimControl::restore_disks) does, reboots every machine that's down, and
-    /// stops every clock's drift. Wall-clock jumps stay, since undoing one is another jump, and
-    /// so does whatever a power cut, wipe, or disk failure lost.
-    /// Each kind of fault the simulator models is lifted here, next to the state it owns.
+    /// stops every clock's drift. BUGGIFY stays off for the rest of the run: every `buggify!`
+    /// is `false`, and the sites reached aren't counted. Wall-clock jumps stay, since undoing
+    /// one is another jump, and so does whatever a power cut, wipe, or disk failure lost. Each
+    /// kind of fault the simulator models is lifted here, next to the state it owns.
     pub fn lift_faults(&self) {
         self.world.lift_faults();
+    }
+
+    /// The run's swarm config: which fault types fault workloads may inject, and which knobs
+    /// were randomized.
+    pub fn swarm(&self) -> &Swarm {
+        &self.world.swarm
     }
 
     /// The run's seed, to name a run, such as a self-test planting a failure at a known seed.

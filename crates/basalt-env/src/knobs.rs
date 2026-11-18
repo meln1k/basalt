@@ -27,13 +27,20 @@ macro_rules! knobs {
 
         impl Knobs {
             /// Sets each knob for which `pick` returns `true` to a value drawn uniformly from its
-            /// declared range. Knobs are visited in declaration order.
-            pub fn randomize(&mut self, rng: &Rng, mut pick: impl FnMut(&'static str) -> bool) {
+            /// declared range, and returns their names. Knobs are visited in declaration order.
+            pub fn randomize(
+                &mut self,
+                rng: &Rng,
+                mut pick: impl FnMut(&'static str) -> bool,
+            ) -> Vec<&'static str> {
+                let mut picked = Vec::new();
                 $(
                     if pick(stringify!($name)) {
                         self.$name = rng.range($range);
+                        picked.push(stringify!($name));
                     }
                 )*
+                picked
             }
 
             #[cfg(test)]
@@ -71,12 +78,12 @@ mod tests {
         let mut changed = false;
         for _ in 0..100 {
             let mut knobs = Knobs::default();
-            knobs.randomize(&rng, |_| true);
+            assert_eq!(knobs.randomize(&rng, |_| true), ["max_buggified_delay"]);
             assert_eq!(knobs.out_of_range(), Vec::<&str>::new());
             changed |= knobs != Knobs::default();
 
             let mut untouched = Knobs::default();
-            untouched.randomize(&rng, |_| false);
+            assert!(untouched.randomize(&rng, |_| false).is_empty());
             assert_eq!(untouched, Knobs::default());
         }
         assert!(changed);

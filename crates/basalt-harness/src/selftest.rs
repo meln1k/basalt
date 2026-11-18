@@ -4,11 +4,15 @@
 //!
 //! The processes share a mailbox in memory instead of a network, so the test needs nothing but
 //! machines, processes, kills, and timers.
+//!
+//! The pong process has a `buggify!` site that ignores a ping, and the pinger a probe for
+//! pings that time out. Each also has a site and a probe behind a check that never passes,
+//! [`UNREACHABLE_PROBE`] among them, so a sweep's coverage report always has some to name.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use basalt_env::{Ctx, Duration, trace};
+use basalt_env::{Ctx, Duration, buggify, probe, trace};
 use basalt_sim::{KillType, MachineId, SimControl};
 
 use crate::history::{History, Outcome};
@@ -37,6 +41,9 @@ pub const PING_PONG_PLANTED: TestSpec = TestSpec {
 
 /// The pong process panics on this pong, counting across its incarnations.
 const PLANTED_PONG: u64 = 5;
+
+/// The name of a probe in the self-test that no seed can reach.
+pub const UNREACHABLE_PROBE: &str = "selftest.ping_number_wrapped";
 
 /// How long the client waits for each pong.
 const PING_TIMEOUT: Duration = Duration::from_millis(100);
@@ -76,6 +83,10 @@ async fn pong(ctx: Ctx, mailbox: Rc<Mailbox>, planted: bool) {
             .range(Duration::from_millis(1)..=Duration::from_millis(10));
         ctx.sleep(wait).await;
         if let Some(n) = mailbox.ping.take() {
+            // A lost ping, which the pinger times out on.
+            if buggify!() {
+                continue;
+            }
             let pongs = mailbox.pongs.get() + 1;
             mailbox.pongs.set(pongs);
             assert!(
@@ -101,6 +112,13 @@ impl Pinger {
     async fn ping(&mut self, ctx: &Ctx) -> bool {
         let n = self.next;
         self.next += 1;
+        // Unreachable: pings are numbered from 0 and no run sends 2^64 of them.
+        if n == u64::MAX {
+            probe!("selftest.ping_number_wrapped");
+            if buggify!() {
+                self.next = 0;
+            }
+        }
         let call = self.history.invoke(ctx, 0, n);
         self.mailbox.ping.set(Some(n));
         let wait = async {
@@ -115,6 +133,8 @@ impl Pinger {
         let answered = ctx.timeout(PING_TIMEOUT, wait).await.is_ok();
         if answered {
             call.ok(ctx, n);
+        } else {
+            probe!("selftest.ping_timed_out");
         }
         answered
     }

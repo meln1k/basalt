@@ -7,7 +7,7 @@
 
 use std::process::{Command, Output};
 
-use basalt_harness::selftest::PLANTED_SEED;
+use basalt_harness::selftest::{PLANTED_SEED, UNREACHABLE_PROBE};
 use basalt_harness::sweep::SIGABRT;
 
 fn basalt(args: &[&str]) -> Output {
@@ -126,7 +126,26 @@ fn sweep_of_a_passing_range_succeeds() {
         "2",
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stdout(&out).contains("passed: 12, failed: 0"));
+    let text = stdout(&out);
+    assert!(text.contains("passed: 12, failed: 0"), "{text}");
+    // The coverage report names the self-test's unreachable probe and buggify! site, and not
+    // the probe every sweep hits.
+    assert!(text.contains("coverage over 12 seeds: "), "{text}");
+    assert!(
+        text.contains(&format!("probe never hit: {UNREACHABLE_PROBE} at ")),
+        "{text}"
+    );
+    assert!(!text.contains("selftest.ping_timed_out"), "{text}");
+    let unreached: Vec<_> = text
+        .lines()
+        .filter(|l| {
+            l.starts_with("buggify! site never fired: crates/basalt-harness/src/selftest.rs:")
+        })
+        .collect();
+    assert!(
+        unreached.iter().any(|l| l.ends_with("(never reached)")),
+        "{text}"
+    );
 }
 
 #[test]

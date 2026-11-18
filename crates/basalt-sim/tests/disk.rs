@@ -1,7 +1,7 @@
 //! Simulated disks: durability through crashes and power cuts, disk faults, latency, and the
 //! path rules every backend follows.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
 use std::rc::Rc;
@@ -743,12 +743,18 @@ fn an_operation_in_flight_when_its_process_dies_fails() {
         let b = node.ctrl.add_machine("other", 0);
         let other = node.ctrl.add_process(b, "other", |_| Box::pin(async {}));
         let (ctrl, machine, c) = (node.ctrl.clone(), node.machine, other.clone());
+        let started = Rc::new(Cell::new(false));
+        let s = started.clone();
+        // Not a short sleep: BUGGIFY may make any sleep end late, after the write is done.
         let killer = other.spawn("killer", Priority::Default, async move {
-            // Every disk operation takes longer than this, so the kill lands mid-operation.
-            c.sleep(Duration::from_micros(1)).await;
+            while !s.get() {
+                c.yield_now().await;
+            }
             ctrl.kill(machine, KillType::Crash);
         });
         let io = other.spawn("io", Priority::Default, async move {
+            // Set in the same poll that starts the write, so the kill lands mid-write.
+            started.set(true);
             let (write, _) = file.write_at(b"after!".to_vec(), 0).await;
             let rename = disk.rename("a", "b").await;
             (write, rename)

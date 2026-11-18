@@ -167,6 +167,7 @@ fn sweep(spec: &TestSpec, range: &SeedRange) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let failed: Vec<u64> = report.failed().map(|(seed, _)| seed).collect();
+    println!("{}", report.coverage);
     println!("passed: {}, failed: {}", report.passed(), failed.len());
     for seed in &failed {
         println!(
