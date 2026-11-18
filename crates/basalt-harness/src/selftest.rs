@@ -8,6 +8,8 @@
 //! The pong process has a `buggify!` site that ignores a ping, and the pinger a probe for
 //! pings that time out. Each also has a site and a probe behind a check that never passes,
 //! [`UNREACHABLE_PROBE`] among them, so a sweep's coverage report always has some to name.
+//!
+//! [`FAULTS`] is the fault workloads' own test: see [`mesh`].
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -17,6 +19,10 @@ use basalt_sim::{KillType, MachineId, SimControl};
 
 use crate::history::{History, Outcome};
 use crate::workload::{TestSpec, Workload, WorkloadResult, Workloads};
+
+pub mod mesh;
+
+pub use mesh::FAULTS;
 
 /// Ping-pong with no planted failure: every seed passes.
 pub const PING_PONG: TestSpec = TestSpec {
@@ -210,4 +216,4 @@ impl Workload for Attrition {
 }
 
 /// The tests in this module.
-pub const TESTS: &[TestSpec] = &[PING_PONG, PING_PONG_PLANTED];
+pub const TESTS: &[TestSpec] = &[PING_PONG, PING_PONG_PLANTED, FAULTS];

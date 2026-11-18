@@ -33,7 +33,7 @@ fn list_shows_the_built_in_tests() {
         .lines()
         .map(|l| l.split_whitespace().next().unwrap().to_owned())
         .collect();
-    assert_eq!(names, ["ping-pong", "ping-pong-planted"]);
+    assert_eq!(names, ["ping-pong", "ping-pong-planted", "faults"]);
 }
 
 #[test]
@@ -146,6 +146,31 @@ fn sweep_of_a_passing_range_succeeds() {
         unreached.iter().any(|l| l.ends_with("(never reached)")),
         "{text}"
     );
+}
+
+/// Every fault type, and every variant of one, strikes in some seed of the fault test, and every
+/// seed passes, so its quiet phase always left every machine up, every link healed, and every
+/// disk writable.
+#[test]
+fn sweep_of_the_fault_test_hits_every_fault_and_passes() {
+    let sweep = |test, seeds| {
+        let out = basalt(&["sim", "sweep", "--test", test, "--seeds", seeds, "-j", "4"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        stdout(&out)
+    };
+    let missed = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("probe never hit: fault."))
+            .map(str::to_owned)
+            .collect()
+    };
+    // Ping-pong runs no fault workload, so its report names every fault probe.
+    let all = missed(&sweep("ping-pong", "0..1"));
+    assert!(all.len() >= 7, "{all:?}");
+
+    let text = sweep("faults", "0..40");
+    assert!(text.contains("passed: 40, failed: 0"), "{text}");
+    assert_eq!(missed(&text), Vec::<String>::new(), "{text}");
 }
 
 #[test]
