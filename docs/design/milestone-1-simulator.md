@@ -30,6 +30,7 @@ Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code 
 | `basalt-rt` | The production backend: the executor loop, the `async-io` reactor, a file I/O pool, and a compute pool | `basalt-env`, `async-io` |
 | `basalt-harness` | The workload trait, test specs, the seed runner and sweep CLI with its coverage report, the linearizability checker | `basalt-env`, `basalt-sim` |
 | `toy-register` | The milestone 1 system under test (an ABD register) and its workloads | `basalt-env` (the workloads also use `basalt-harness`) |
+| `basalt-server` | `basalt server`: a register replica on `basalt-rt` | `basalt-rt`, `toy-register`; never `basalt-sim` or `basalt-harness` (enforced by `cargo-deny`) |
 | `basalt` | The one shipped binary: `basalt server` runs on `basalt-rt`, `basalt sim` runs tests on `basalt-sim` | Everything above |
 
 Later crates (`basalt-raft`, `basalt-meta`, `basalt-s3`) follow the same rule as `toy-register`: they depend on `basalt-env` and never on a backend. Only the `basalt` binary picks a backend, at startup, from its subcommand.
@@ -291,7 +292,7 @@ The demo: a sweep with a bug on finds a failing seed, `run --seed N` replays the
 - **Process-scoped behavior creeps into the ambient API.** For example, someone adds an ambient `spawn` for convenience. Earliest signal: a change to the ambient section of `basalt-env`, which code review should treat as a design change.
 - **A `buggify!` site sits in code that only runs off the simulator thread**, so it never fires. Earliest signal: the sweep's coverage report lists the site as never hit.
 - **Test code bloats the release binary.** Earliest signal: binary size growing with each workload. Mitigation: keep heavy fixtures as data generated from the seed, not compiled tables.
-- **Simulation-only code runs in production by mistake.** Earliest signal: `SimControl` or a workload becoming reachable from `basalt server`. Mitigation: only the `sim` subcommand constructs `basalt-sim` types, and a smoke test checks that `basalt server` never installs a simulated world.
+- **Simulation-only code runs in production by mistake.** Earliest signal: `SimControl` or a workload becoming reachable from `basalt server`. Mitigation: `basalt server` lives in its own crate, `basalt-server`, and `cargo-deny` lets only `basalt-harness` (and `toy-register`'s tests) depend on `basalt-sim` and only the `basalt` binary depend on `basalt-harness`, so the server can't name a simulator type.
 - **Boxed futures behind `dyn Backend` cost too much in production.** Earliest signal: allocation-heavy profiles in milestone 2 benchmarks.
 
 ## Out of scope for milestone 1

@@ -24,4 +24,9 @@ deny = [
     { crate = "async-io", wrappers = ["basalt-rt"], reason = "only basalt-rt may use a real reactor" },
     { crate = "polling", wrappers = ["async-io"], reason = "only basalt-rt may use a real reactor" },
     { crate = "futures-lite", wrappers = ["async-io", "basalt-rt"], reason = "its block_on and timers bypass Ctx" },
+    # Simulation-only code must never run in `basalt server`: only the harness builds simulated
+    # worlds, and only the `basalt` binary (its `sim` subcommand) reaches the harness. Adding a
+    # crate to either list is a deliberate decision for review.
+    { crate = "basalt-sim", wrappers = ["basalt-harness", "toy-register"], reason = "only basalt-harness and toy-register's tests may build a simulated world" },
+    { crate = "basalt-harness", wrappers = ["basalt"], reason = "only `basalt sim` may run simulation tests" },
 ]

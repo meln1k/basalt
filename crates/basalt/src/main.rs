@@ -16,8 +16,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a server on the real network and disks.
-    Server,
+    /// Run a register replica on the real network and disks.
+    Server(basalt_server::ServerArgs),
     /// Run simulation tests against this exact build.
     #[command(subcommand)]
     Sim(SimCommand),
@@ -25,10 +25,7 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Server => {
-            eprintln!("basalt server: not implemented yet");
-            ExitCode::FAILURE
-        }
+        Command::Server(args) => basalt_server::main(args),
         Command::Sim(command) => {
             basalt_harness::cli::main(command, basalt_harness::selftest::TESTS)
         }
