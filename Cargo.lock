@@ -397,6 +397,11 @@ dependencies = [
 [[package]]
 name = "toy-register"
 version = "0.1.0"
+dependencies = [
+ "basalt-env",
+ "basalt-sim",
+ "futures-io",
+]
 
 [[package]]
 name = "unicode-ident"

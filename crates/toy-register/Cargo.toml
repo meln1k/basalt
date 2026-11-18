@@ -7,3 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+basalt-env = { path = "../basalt-env" }
+futures-io = "0.3.34"
+
+[dev-dependencies]
+basalt-sim = { path = "../basalt-sim" }
