@@ -9,5 +9,10 @@ publish.workspace = true
 
 [dependencies]
 basalt-harness = { path = "../basalt-harness" }
+basalt-server = { path = "../basalt-server" }
 clap = { version = "4.6.7", features = ["derive"] }
 
+[dev-dependencies]
+basalt-env = { path = "../basalt-env" }
+basalt-rt = { path = "../basalt-rt" }
+toy-register = { path = "../toy-register" }
