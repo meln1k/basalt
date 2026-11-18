@@ -15,6 +15,15 @@ pub enum RegisterOp<K, V> {
     Write(K, V),
 }
 
+impl<K, V> RegisterOp<K, V> {
+    /// The key the operation reads or writes.
+    pub fn key(&self) -> &K {
+        match self {
+            RegisterOp::Read(key) | RegisterOp::Write(key, _) => key,
+        }
+    }
+}
+
 /// What a [`RegisterOp`] returned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RegisterOutput<V> {
@@ -54,9 +63,7 @@ where
     type Output = RegisterOutput<V>;
 
     fn key(&self, input: &RegisterOp<K, V>) -> K {
-        match input {
-            RegisterOp::Read(key) | RegisterOp::Write(key, _) => key.clone(),
-        }
+        input.key().clone()
     }
 
     fn init(&self) -> Option<V> {

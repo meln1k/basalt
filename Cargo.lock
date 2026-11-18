@@ -111,6 +111,7 @@ dependencies = [
  "basalt-sim",
  "clap",
  "futures-io",
+ "toy-register",
 ]
 
 [[package]]

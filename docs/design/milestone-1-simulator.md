@@ -28,8 +28,8 @@ Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code 
 | `basalt-env` | The `Ctx` type, the ambient world behind `buggify!`, `probe!`, `trace!`, and knobs, time and address types, I/O errors, deterministic collections, and the static registry of every `buggify!` site and probe | `async-task`, `futures-io`, `linkme` |
 | `basalt-sim` | The simulated world: executor, virtual time, network, disks, machines and processes, BUGGIFY, per-seed knobs and swarm configs, and the fault control API | `basalt-env` |
 | `basalt-rt` | The production backend: the executor loop, the `async-io` reactor, a file I/O pool, and a compute pool | `basalt-env`, `async-io` |
-| `basalt-harness` | The workload trait, test specs, the seed runner and sweep CLI with its coverage report, the linearizability checker | `basalt-env`, `basalt-sim` |
-| `toy-register` | The milestone 1 system under test (an ABD register) and its workloads | `basalt-env` (the workloads also use `basalt-harness`) |
+| `basalt-harness` | The workload trait, test specs, the seed runner and sweep CLI with its coverage report, the linearizability checker, and the register's workloads | `basalt-env`, `basalt-sim`, `toy-register` |
+| `toy-register` | The milestone 1 system under test (an ABD register) | `basalt-env` |
 | `basalt-server` | `basalt server`: a register replica on `basalt-rt` | `basalt-rt`, `toy-register`; never `basalt-sim` or `basalt-harness` (enforced by `cargo-deny`) |
 | `basalt` | The one shipped binary: `basalt server` runs on `basalt-rt`, `basalt sim` runs tests on `basalt-sim` | Everything above |
 

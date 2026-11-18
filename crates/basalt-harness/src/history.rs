@@ -44,6 +44,31 @@ pub struct Entry<I, O> {
     pub outcome: Outcome<O>,
 }
 
+/// One line for a failure report: who invoked what, and when it was called and returned, by
+/// event position and virtual time.
+impl<I: fmt::Debug, O: fmt::Debug> fmt::Display for Entry<I, O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Entry {
+            client,
+            input,
+            call,
+            outcome,
+        } = self;
+        write!(
+            f,
+            "client {client}: {input:?}, called #{} at {:?}",
+            call.position, call.time
+        )?;
+        match outcome {
+            Outcome::Ok { output, at } => {
+                write!(f, ", returned {output:?} #{} at {:?}", at.position, at.time)
+            }
+            Outcome::Failed { at } => write!(f, ", failed #{} at {:?}", at.position, at.time),
+            Outcome::Indeterminate => write!(f, ", no response"),
+        }
+    }
+}
+
 /// A recorder of operations with inputs of type `I` and outputs of type `O`. Clones share one
 /// history, so each client task can hold its own.
 pub struct History<I, O> {
@@ -115,14 +140,16 @@ impl<I: Clone, O: Clone> History<I, O> {
         self.inner.borrow().entries.clone()
     }
 
-    /// The operations for the [checkers](crate::checker), timed by event positions. Failed
-    /// operations are left out, since they had no effect.
-    pub fn to_checker(&self) -> Vec<checker::Operation<I, O>> {
+    /// The operations for the [checkers](crate::checker), timed by event positions, and the
+    /// index in [`entries`](History::entries) of each, to map a checker's report back to the
+    /// entries. Failed operations are left out, since they had no effect.
+    pub fn to_checker(&self) -> (Vec<checker::Operation<I, O>>, Vec<usize>) {
         let inner = self.inner.borrow();
         inner
             .entries
             .iter()
-            .filter_map(|entry| {
+            .enumerate()
+            .filter_map(|(index, entry)| {
                 let outcome = match &entry.outcome {
                     Outcome::Ok { output, at } => checker::Outcome::Ok {
                         output: output.clone(),
@@ -131,13 +158,14 @@ impl<I: Clone, O: Clone> History<I, O> {
                     Outcome::Indeterminate => checker::Outcome::Indeterminate,
                     Outcome::Failed { .. } => return None,
                 };
-                Some(checker::Operation {
+                let operation = checker::Operation {
                     input: entry.input.clone(),
                     call: entry.call.position,
                     outcome,
-                })
+                };
+                Some((operation, index))
             })
-            .collect()
+            .unzip()
     }
 }
 
@@ -229,7 +257,8 @@ mod tests {
         assert_eq!(entries[2].client, 3);
 
         // The failed write had no effect, so the checkers don't see it.
-        let ops = history.to_checker();
+        let (ops, indices) = history.to_checker();
+        assert_eq!(indices, [1, 2]);
         let inputs: Vec<_> = ops.iter().map(|op| op.input.clone()).collect();
         assert_eq!(inputs, [RegisterOp::Read("k"), RegisterOp::Write("k", 2)]);
         assert_eq!(
@@ -260,6 +289,6 @@ mod tests {
                 .iter()
                 .all(|e| e.call.time == Instant::ZERO)
         );
-        assert!(check_register_linearizability(&history.to_checker()).is_err());
+        assert!(check_register_linearizability(&history.to_checker().0).is_err());
     }
 }
