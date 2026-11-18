@@ -50,7 +50,7 @@ use std::task::{Context, Poll, Waker};
 use basalt_env::backend::LocalBoxFuture;
 use basalt_env::world::WorldGuard;
 use basalt_env::{
-    Ctx, DiskId, Duration, Instant, IpAddr, Priority, SystemTime, Task, TaskId, trace,
+    Ctx, DiskId, Duration, Instant, IpAddr, Priority, Rng, SystemTime, Task, TaskId, trace,
 };
 
 pub use crate::buggify::{BUGGIFY_SWITCH_PROBABILITY, Coverage, SiteHits};
@@ -233,6 +233,14 @@ impl SimControl {
     /// were randomized.
     pub fn swarm(&self) -> &Swarm {
         &self.world.swarm
+    }
+
+    /// The `faults` stream, which the swarm config was drawn from. Fault workloads draw their
+    /// targets and timing from it, or from a [`fork`](Rng::fork) of it taken while the test
+    /// is built, so the faults of a seed stay the same however the system under test draws
+    /// from `ctx.rng()` or reaches `buggify!` sites.
+    pub fn fault_rng(&self) -> &Rng {
+        self.world.fault_rng()
     }
 
     /// The run's seed, to name a run, such as a self-test planting a failure at a known seed.

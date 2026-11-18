@@ -58,3 +58,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --bin basalt
       - run: target/release/basalt sim check-determinism --test ping-pong --seeds 0..200
+      - run: target/release/basalt sim check-determinism --test faults --seeds 0..200

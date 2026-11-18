@@ -266,6 +266,10 @@ impl SimWorld {
         true
     }
 
+    pub(crate) fn fault_rng(&self) -> &Rng {
+        &self.streams.faults
+    }
+
     pub(crate) fn coverage(&self) -> Coverage {
         self.buggify.coverage()
     }
@@ -386,8 +390,14 @@ impl Backend for SimWorld {
             return Box::pin(pending());
         }
         let mut deadline = deadline;
-        // Timers may fire late, never early, as in FoundationDB's `delay`.
-        if deadline != Instant::MAX && buggify!() {
+        // Timers may fire late, never early, as in FoundationDB's `delay`. Not on a protected
+        // machine, the harness's: its fault workloads time faults from the `faults` stream, and
+        // a delay drawn from the `buggify` stream, which the system under test also draws
+        // from, would shift them whenever that system changes.
+        let protected = self
+            .machines
+            .is_protected(self.machines.machine_of(process));
+        if deadline != Instant::MAX && !protected && buggify!() {
             let extra = self
                 .streams
                 .buggify

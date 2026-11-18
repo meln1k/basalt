@@ -106,6 +106,7 @@ dependencies = [
  "basalt-env",
  "basalt-sim",
  "clap",
+ "futures-io",
 ]
 
 [[package]]
