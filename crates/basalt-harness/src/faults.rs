@@ -320,8 +320,8 @@ fn clock_skew(sim: &SimControl, rng: &Rng, machines: &[MachineId]) {
     }
 }
 
-/// Fills one disk of `machines` if `full`, or else makes one fail reads and writes or flip bits
-/// on read. Returns `None` if no machine has a disk. The caller restores every disk later.
+/// Fills one disk of `machines` if `full`, or else makes one fail reads, writes, and syncs, or
+/// flip bits on read. Returns `None` if no machine has a disk. The caller restores every disk later.
 fn disk_fault(sim: &SimControl, rng: &Rng, machines: &[MachineId], full: bool) -> Option<()> {
     let disks: Vec<DiskId> = machines
         .iter()

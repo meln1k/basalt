@@ -105,7 +105,8 @@ fn zero_page() -> Page {
 }
 
 /// A file's contents: a live image that reads see and a durable image that survives a power
-/// cut. The two differ only in the pages listed in `dirty`, so `sync` copies just those.
+/// cut. The two differ only in the pages listed in `dirty`, so `sync` copies just those, unless
+/// a failed sync lost some (`lost`).
 ///
 /// Its live length counts toward its disk's `usage` for as long as the inode exists: while it
 /// has a live or durable name, or an open handle, as on Linux.
@@ -118,6 +119,9 @@ pub(super) struct Inode {
     /// The pages changed since the last sync, each with the most damaging mode of the handles
     /// that changed it.
     dirty: BTreeMap<u64, CorruptionMode>,
+    /// Whether a failed sync marked pages clean without making them durable, so the live image
+    /// may differ from the durable one outside `dirty` until a power cut.
+    lost: bool,
 }
 
 impl Clone for Inode {
@@ -130,6 +134,7 @@ impl Clone for Inode {
             durable_len: self.durable_len,
             durable: self.durable.clone(),
             dirty: self.dirty.clone(),
+            lost: self.lost,
         }
     }
 }
@@ -150,6 +155,7 @@ impl Inode {
             durable_len: 0,
             durable: Pages::new(),
             dirty: BTreeMap::new(),
+            lost: false,
         }
     }
 
@@ -199,12 +205,20 @@ impl Inode {
         self.durable_len = self.len;
     }
 
+    /// What a failed sync does on Linux: marks the pages changed since the last sync clean
+    /// without making them durable. Reads still see them, a later sync doesn't write them, and
+    /// a power cut reverts them. The length stays pending.
+    pub(super) fn lose_dirty(&mut self) {
+        self.lost |= !self.dirty.is_empty();
+        self.dirty.clear();
+    }
+
     /// Replaces both images with what survives a power cut, or returns `None` if nothing was
     /// pending.
     pub(super) fn power_cut(&mut self, rng: &Rng) -> Option<Cut> {
         let resized = self.len != self.durable_len;
         let worst_mode = self.dirty.values().copied().max();
-        if worst_mode.is_none() && !resized {
+        if worst_mode.is_none() && !resized && !self.lost {
             return None;
         }
         let length_kept = !resized || rng.bool(LENGTH_KEPT_PROBABILITY);
@@ -252,6 +266,7 @@ impl Inode {
         truncate(&mut self.durable, len);
         self.durable_len = len;
         self.dirty.clear();
+        self.lost = false;
         self.pages.clone_from(&self.durable);
         self.resize(len);
         Some(cut)
