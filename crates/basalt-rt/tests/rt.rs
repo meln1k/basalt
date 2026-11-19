@@ -328,6 +328,18 @@ fn directories_are_implicit() {
             kind(disk.sync_dir("d/a").await),
             io::ErrorKind::NotADirectory
         );
+
+        // A failed rename creates nothing, like in simulation.
+        assert_eq!(
+            kind(disk.rename("missing", "g/h/x").await),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            kind(disk.rename("d/sub", "i/j/x").await),
+            io::ErrorKind::IsADirectory
+        );
+        assert!(!dir.0.join("g").exists());
+        assert!(!dir.0.join("i").exists());
     });
 }
 

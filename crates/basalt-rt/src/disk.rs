@@ -9,7 +9,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture};
+use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture, check_dir, check_path};
 use basalt_env::{OpenOptions, Space};
 
 use crate::pool::Pool;
@@ -41,29 +41,16 @@ impl Disk {
         }
     }
 
-    /// A file's path: non-empty components without `.` or `..`.
+    /// A file's path on the host.
     fn file(&self, path: &str) -> io::Result<PathBuf> {
-        let valid = !path.is_empty()
-            && !path.contains('\0')
-            && path
-                .split('/')
-                .all(|part| !part.is_empty() && part != "." && part != "..");
-        if !valid {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid disk path {path:?}: use relative `a/b` paths without `.` or `..`"),
-            ));
-        }
+        check_path(path)?;
         Ok(self.root.join(path))
     }
 
-    /// A directory's path: like a file's, or `""` for the root.
+    /// A directory's path on the host; `""` is the root.
     fn dir(&self, dir: &str) -> io::Result<PathBuf> {
-        if dir.is_empty() {
-            Ok(self.root.to_path_buf())
-        } else {
-            self.file(dir)
-        }
+        check_dir(dir)?;
+        Ok(self.root.join(dir))
     }
 }
 
@@ -104,10 +91,13 @@ impl DiskIo for Disk {
         let to = self.file(to);
         self.run(self.file(from), move |from| {
             let to = to?;
-            for path in [&from, &to] {
-                if path.is_dir() {
-                    return Err(is_a_directory(path));
-                }
+            // Check both names before creating the directories above `to`, so a failed rename
+            // leaves nothing behind.
+            if fs::symlink_metadata(&from)?.is_dir() {
+                return Err(is_a_directory(&from));
+            }
+            if to.is_dir() {
+                return Err(is_a_directory(&to));
             }
             create_parents(&to)?;
             fs::rename(from, to)
