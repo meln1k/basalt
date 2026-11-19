@@ -187,19 +187,23 @@ The monotonic clock is shared virtual time, with an optional drift rate per mach
 - `probe!("name")` counts how often a rare path is reached. The sweep reports probes that no seed hit, so we know when a test stops exercising what it claims to.
 - **Swarm testing:** each seed enables a random subset of fault types and knob randomizations, so rare combinations get explored.
 
-## Tests are workloads run in two phases
+## Tests are workloads run in phases
 
 ```rust
 trait Workload {
-    async fn setup(&mut self, ctx: &Ctx) -> Result<()>;
-    async fn start(&mut self, ctx: &Ctx, sim: &SimControl) -> Result<()>;
-    async fn check(&mut self, ctx: &Ctx, history: &History) -> Result<()>;
+    async fn setup(&mut self, sim: &SimControl) -> Result<()>;
+    async fn start(&mut self, sim: &SimControl) -> Result<()>;
+    async fn liveness(&mut self, sim: &SimControl) -> Result<()>;
+    async fn check(&mut self, sim: &SimControl) -> Result<()>;
 }
 ```
 
-1. **Chaos phase.** Client workloads run alongside fault workloads (attrition, power cuts, clogging, partitions, clock skew, full disks) for a set virtual duration.
-2. **Quiet phase.** Every fault is lifted: machines reboot, links heal, disks get space back. Within a deadline, a fresh write and read must succeed. This checks liveness, which the safety invariants alone don't cover.
-3. **Check.** Checkers run over the recorded history.
+1. **Setup.** Workloads prepare, before any fault.
+2. **Chaos phase.** Client workloads run alongside fault workloads (attrition, power cuts, clogging, partitions, clock skew, full disks) for a set virtual duration.
+3. **Quiet phase.** Every fault is lifted: machines reboot, links heal, disks get space back. Within a deadline, each workload's `liveness` must succeed, such as a fresh write and read. This checks liveness, which the safety invariants alone don't cover.
+4. **Check.** Each workload runs the checkers over the history it recorded.
+
+The runner drives the workloads from outside every process, with `Sim::block_on` on a plain future, so no kill or cancel can stop the test itself. Workloads time themselves on the world's clock (`SimControl::sleep` and `SimControl::timeout`), which no machine's drift or `buggify!` moves. A workload acts as a process through a `Process` it adds in the test's build, on a machine of its own. Faults hit that machine like any other: partitions cut its links, kills drop its requests in flight, and BUGGIFY delays its timers and cancels its detached tasks. So no machine is exempt from faults.
 
 `SimControl` lives in `basalt-sim`, so production code can't reach the fault API. Test specs are Rust functions in milestone 1, with TOML specs later.
 

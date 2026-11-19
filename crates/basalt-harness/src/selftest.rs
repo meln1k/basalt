@@ -14,7 +14,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use basalt_env::{Ctx, Duration, buggify, probe, trace};
+use basalt_env::{Ctx, Duration, Rng, buggify, probe, trace};
 use basalt_sim::{KillType, MachineId, SimControl};
 
 use crate::history::{History, Outcome};
@@ -75,8 +75,12 @@ fn build(sim: &SimControl, planted: bool) -> Workloads {
             mailbox,
             history: History::new(),
             next: 0,
+            rng: sim.fault_rng().fork(),
         })
-        .add(Attrition { machine });
+        .add(Attrition {
+            machine,
+            rng: sim.fault_rng().fork(),
+        });
     workloads
 }
 
@@ -105,17 +109,19 @@ async fn pong(ctx: Ctx, mailbox: Rc<Mailbox>, planted: bool) {
     }
 }
 
-/// Sends numbered pings and records each as an operation whose output is the number echoed.
+/// Sends numbered pings, from outside every process, and records each as an operation whose
+/// output is the number echoed.
 struct Pinger {
     mailbox: Rc<Mailbox>,
     history: History<u64, u64>,
     next: u64,
+    rng: Rng,
 }
 
 impl Pinger {
     /// Sends one ping and waits for its pong. Returns whether it came back in time; if not,
     /// the operation stays indeterminate.
-    async fn ping(&mut self, ctx: &Ctx) -> bool {
+    async fn ping(&mut self, sim: &SimControl) -> bool {
         let n = self.next;
         self.next += 1;
         // Unreachable: pings are numbered from 0 and no run sends 2^64 of them.
@@ -125,20 +131,20 @@ impl Pinger {
                 self.next = 0;
             }
         }
-        let call = self.history.invoke(ctx, 0, n);
+        let call = self.history.invoke(sim, 0, n);
         self.mailbox.ping.set(Some(n));
         let wait = async {
             loop {
-                ctx.sleep(Duration::from_millis(1)).await;
+                sim.sleep(Duration::from_millis(1)).await;
                 // Drops a late pong to an earlier ping.
                 if self.mailbox.pong.take() == Some(n) {
                     return;
                 }
             }
         };
-        let answered = ctx.timeout(PING_TIMEOUT, wait).await.is_ok();
+        let answered = sim.timeout(PING_TIMEOUT, wait).await.is_ok();
         if answered {
-            call.ok(ctx, n);
+            call.ok(sim, n);
         } else {
             probe!("selftest.ping_timed_out");
         }
@@ -151,20 +157,20 @@ impl Workload for Pinger {
         "pinger"
     }
 
-    async fn start(&mut self, ctx: &Ctx, _: &SimControl) -> WorkloadResult {
+    async fn start(&mut self, sim: &SimControl) -> WorkloadResult {
         loop {
-            self.ping(ctx).await;
-            let pause = ctx.rng().range(Duration::ZERO..Duration::from_millis(5));
-            ctx.sleep(pause).await;
+            self.ping(sim).await;
+            let pause = self.rng.range(Duration::ZERO..Duration::from_millis(5));
+            sim.sleep(pause).await;
         }
     }
 
-    async fn liveness(&mut self, ctx: &Ctx) -> WorkloadResult {
-        while !self.ping(ctx).await {}
+    async fn liveness(&mut self, sim: &SimControl) -> WorkloadResult {
+        while !self.ping(sim).await {}
         Ok(())
     }
 
-    async fn check(&mut self, _: &Ctx) -> WorkloadResult {
+    async fn check(&mut self, _: &SimControl) -> WorkloadResult {
         let entries = self.history.entries();
         let mut answered = 0;
         for entry in &entries {
@@ -192,6 +198,7 @@ impl Workload for Pinger {
 /// Crashes the pong machine and reboots it, again and again.
 struct Attrition {
     machine: MachineId,
+    rng: Rng,
 }
 
 impl Workload for Attrition {
@@ -199,17 +206,17 @@ impl Workload for Attrition {
         "attrition"
     }
 
-    async fn start(&mut self, ctx: &Ctx, sim: &SimControl) -> WorkloadResult {
+    async fn start(&mut self, sim: &SimControl) -> WorkloadResult {
         loop {
-            let up = ctx
-                .rng()
+            let up = self
+                .rng
                 .range(Duration::from_millis(100)..Duration::from_millis(500));
-            ctx.sleep(up).await;
+            sim.sleep(up).await;
             sim.kill(self.machine, KillType::Crash);
-            let down = ctx
-                .rng()
+            let down = self
+                .rng
                 .range(Duration::from_millis(10)..Duration::from_millis(200));
-            ctx.sleep(down).await;
+            sim.sleep(down).await;
             sim.reboot(self.machine);
         }
     }

@@ -236,18 +236,12 @@ impl SimWorld {
     /// picked from the `buggify` stream, as dropping its handle would have. It catches code
     /// that assumes work after an `.await` always completes. Only detached tasks are picked,
     /// because a task whose handle someone awaits can only vanish when its process dies, and
-    /// a kill already covers that. A process's main task and every task on a protected
-    /// machine are spared, since without them a process or the run itself stops doing
-    /// anything at all. Returns whether it cancelled a task.
+    /// a kill already covers that. A process's main task is spared, since without it the
+    /// process stops doing anything at all. Returns whether it cancelled a task.
     fn cancel_random_task(&self) -> bool {
         let mut tasks = self.executor.detached_tasks();
         let main_tasks = self.main_tasks.borrow();
-        tasks.retain(|t| {
-            !main_tasks.contains(&t.id)
-                && !self
-                    .machines
-                    .is_protected(self.machines.machine_of(t.process))
-        });
+        tasks.retain(|t| !main_tasks.contains(&t.id));
         drop(main_tasks);
         if tasks.is_empty() {
             return false;
@@ -280,19 +274,29 @@ impl SimWorld {
         hasher.finish()
     }
 
-    /// The run loop, after FoundationDB's `Sim2::runLoop`: while `more` holds, polls the next
-    /// ready task, or if none is ready, moves time to the next timer. Stops at the first `Error`
-    /// trace, or when no task can make progress.
-    pub(crate) fn run_while(&self, mut more: impl FnMut() -> bool) -> Result<(), SimError> {
+    /// The run loop, after FoundationDB's `Sim2::runLoop`, for a test whose driver is `step`.
+    /// Each turn calls `step`, which returns the run's result once the driver is done, then
+    /// polls the next ready task, or if none is ready and `driver_ready` doesn't hold, moves
+    /// time to the next timer. Stops at the first `Error` trace, or when nothing can make
+    /// progress.
+    pub(crate) fn run_until<T>(
+        &self,
+        mut step: impl FnMut() -> Option<T>,
+        driver_ready: impl Fn() -> bool,
+    ) -> Result<T, SimError> {
         loop {
+            let done = step();
             if let Some(record) = self.trace.first_error() {
                 return Err(SimError::ErrorTrace(record));
             }
-            if !more() {
-                return Ok(());
+            if let Some(output) = done {
+                return Ok(output);
             }
             if let Some(runnable) = self.executor.pop_ready(&self.streams.scheduler) {
                 self.poll(runnable);
+                continue;
+            }
+            if driver_ready() {
                 continue;
             }
             let Some(next) = self.clock.next_deadline() else {
@@ -390,14 +394,8 @@ impl Backend for SimWorld {
             return Box::pin(pending());
         }
         let mut deadline = deadline;
-        // Timers may fire late, never early, as in FoundationDB's `delay`. Not on a protected
-        // machine, the harness's: its fault workloads time faults from the `faults` stream, and
-        // a delay drawn from the `buggify` stream, which the system under test also draws
-        // from, would shift them whenever that system changes.
-        let protected = self
-            .machines
-            .is_protected(self.machines.machine_of(process));
-        if deadline != Instant::MAX && !protected && buggify!() {
+        // Timers may fire late, never early, as in FoundationDB's `delay`.
+        if deadline != Instant::MAX && buggify!() {
             let extra = self
                 .streams
                 .buggify

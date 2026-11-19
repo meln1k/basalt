@@ -3,8 +3,9 @@
 //! [`Swarm`](basalt_sim::Swarm) config enables. They run in the chaos phase; the runner's quiet
 //! phase lifts whatever they leave behind ([`SimControl::lift_faults`]).
 //!
-//! Each workload picks its targets from [`SimControl::machines`], so it never touches the
-//! harness's machine, and draws its targets and timing from its own fork of the `faults` stream
+//! Each workload picks its targets from [`SimControl::machines`], every machine of the test,
+//! including the ones its client processes run on. It times its faults on the world's clock
+//! ([`SimControl::sleep`]) and draws its targets and timing from its own fork of the `faults` stream
 //! ([`SimControl::fault_rng`]). So a seed's faults don't move when the system under test changes,
 //! such as when a planted bug is switched on, and one fault type's draws don't depend on another
 //! type's being enabled. They react only to what other faults did, such as which machines are
@@ -16,7 +17,7 @@
 
 use std::ops::Range;
 
-use basalt_env::{Ctx, DiskId, Duration, Instant, Rng, probe, trace};
+use basalt_env::{DiskId, Duration, Instant, Rng, probe, trace};
 use basalt_sim::{Fault, KillType, MachineId, SimControl};
 
 use crate::workload::{Workload, WorkloadResult, Workloads};
@@ -80,7 +81,7 @@ impl Workload for FaultWorkload {
         }
     }
 
-    async fn start(&mut self, ctx: &Ctx, sim: &SimControl) -> WorkloadResult {
+    async fn start(&mut self, sim: &SimControl) -> WorkloadResult {
         let (rng, wipes) = (&self.rng, self.wipes);
         let machines = sim.machines();
         if machines.is_empty() {
@@ -90,26 +91,26 @@ impl Workload for FaultWorkload {
         let secs = Duration::from_secs;
         match self.fault {
             Fault::Attrition => {
-                strike(ctx, rng, ms(500)..secs(5), || {
+                strike(sim, rng, ms(500)..secs(5), || {
                     attrition(sim, rng, &machines, wipes, ms(100)..secs(3))
                 })
                 .await
             }
             Fault::PowerCut => {
-                strike(ctx, rng, secs(3)..secs(15), || {
+                strike(sim, rng, secs(3)..secs(15), || {
                     power_cut(sim, rng, &machines, ms(100)..secs(3))
                 })
                 .await
             }
             Fault::Clog => {
-                strike(ctx, rng, ms(100)..secs(2), || {
+                strike(sim, rng, ms(100)..secs(2), || {
                     clog(sim, rng, &machines, ms(10)..secs(2));
                     None
                 })
                 .await
             }
             Fault::Partition => {
-                strike(ctx, rng, secs(2)..secs(10), || {
+                strike(sim, rng, secs(2)..secs(10), || {
                     partition(sim, rng, &machines);
                     let undo: Undo<'_> = Box::new(|| sim.heal_network());
                     Some((rng.range(ms(500)..secs(10)), undo))
@@ -117,7 +118,7 @@ impl Workload for FaultWorkload {
                 .await
             }
             Fault::ClockSkew => {
-                strike(ctx, rng, secs(1)..secs(10), || {
+                strike(sim, rng, secs(1)..secs(10), || {
                     clock_skew(sim, rng, &machines);
                     None
                 })
@@ -125,7 +126,7 @@ impl Workload for FaultWorkload {
             }
             Fault::DiskFull | Fault::DiskErrors => {
                 let full = self.fault == Fault::DiskFull;
-                strike(ctx, rng, secs(2)..secs(10), || {
+                strike(sim, rng, secs(2)..secs(10), || {
                     disk_fault(sim, rng, &machines, full)?;
                     let undo: Undo<'_> = Box::new(|| sim.restore_disks());
                     Some((rng.range(ms(500)..secs(5)), undo))
@@ -141,18 +142,18 @@ impl Workload for FaultWorkload {
 /// lasts and how to undo it, if it needs undoing; each undo runs when its time comes, so
 /// faults of one type may overlap.
 async fn strike<'a>(
-    ctx: &Ctx,
+    sim: &SimControl,
     rng: &Rng,
     gap: Range<Duration>,
     mut inject: impl FnMut() -> Option<(Duration, Undo<'a>)>,
 ) -> WorkloadResult {
     let mut undos: Vec<(Instant, Undo<'a>)> = Vec::new();
-    let mut next = ctx.now() + rng.range(gap.clone());
+    let mut next = sim.now() + rng.range(gap.clone());
     loop {
         let due = undos.iter().map(|&(at, _)| at).fold(next, Instant::min);
-        ctx.sleep(due.checked_duration_since(ctx.now()).unwrap_or_default())
+        sim.sleep(due.checked_duration_since(sim.now()).unwrap_or_default())
             .await;
-        let now = ctx.now();
+        let now = sim.now();
         let (ready, later) = undos.into_iter().partition(|&(at, _)| at <= now);
         undos = later;
         for (_, undo) in ready {
@@ -391,7 +392,7 @@ mod tests {
     struct Idle;
 
     impl Workload for Idle {
-        async fn start(&mut self, _: &Ctx, _: &SimControl) -> WorkloadResult {
+        async fn start(&mut self, _: &SimControl) -> WorkloadResult {
             std::future::pending().await
         }
     }

@@ -5,15 +5,11 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 
 use basalt_env::backend::LocalBoxFuture;
-use basalt_env::{Ctx, Duration, Priority, trace};
+use basalt_env::{Duration, trace};
 use basalt_sim::{Coverage, Sim, SimControl, SimError, TraceRecord};
 
 use crate::panic_hook;
 use crate::workload::{DynWorkload, TestSpec, WorkloadResult};
-
-/// The label and failure zone of the machine the harness runs its workloads on. It's protected
-/// from faults, so fault workloads never see it.
-pub const HARNESS: &str = "harness";
 
 /// How long, in virtual time, the setup and the check phases may each take. Every phase has a
 /// deadline, because a system with a timer always pending never trips the hang detector.
@@ -90,17 +86,10 @@ pub fn run(spec: &TestSpec, seed: u64, on_trace: impl FnMut(&TraceRecord) + 'sta
         randomized_knobs = swarm.randomized_knobs(),
         knobs = basalt_env::knobs()
     );
-    // Before the test adds anything, so `machines()` never lists it, in `build` or later.
-    let machine = control.add_machine(HARNESS, 0);
-    control.protect(machine);
-    let ctx = control.add_process(machine, HARNESS, |_| Box::pin(async {}));
     let workloads = (spec.build)(&control).0;
-    let task = ctx.spawn(
-        "harness",
-        Priority::Default,
-        phases(*spec, ctx.clone(), control, workloads),
-    );
-    let result = sim.block_on(task).unwrap_or_else(|e| Err(Failure::Sim(e)));
+    let result = sim
+        .block_on(phases(*spec, control, workloads))
+        .unwrap_or_else(|e| Err(Failure::Sim(e)));
     RunReport {
         test: spec.name,
         seed,
@@ -110,28 +99,26 @@ pub fn run(spec: &TestSpec, seed: u64, on_trace: impl FnMut(&TraceRecord) + 'sta
     }
 }
 
+/// Drives the workloads through every phase, from outside every process, so no fault stops it.
 async fn phases(
     spec: TestSpec,
-    ctx: Ctx,
     sim: SimControl,
     mut workloads: Vec<Box<dyn DynWorkload>>,
 ) -> Result<(), Failure> {
     trace!(Info, "SetupPhase");
     let setup = all(
         Phase::Setup,
-        workloads.iter_mut().map(|w| (w.name(), w.setup(&ctx))),
+        workloads.iter_mut().map(|w| (w.name(), w.setup(&sim))),
     );
-    within(&ctx, Phase::Setup, PHASE_DEADLINE, setup).await?;
+    within(&sim, Phase::Setup, PHASE_DEADLINE, setup).await?;
 
     trace!(Info, "ChaosPhase", duration = spec.chaos);
     let chaos = all(
         Phase::Chaos,
-        workloads
-            .iter_mut()
-            .map(|w| (w.name(), w.start(&ctx, &sim))),
+        workloads.iter_mut().map(|w| (w.name(), w.start(&sim))),
     );
     // The chaos phase ends when its time is up; only an error before then fails the run.
-    if let Ok(result) = ctx.timeout(spec.chaos, chaos).await {
+    if let Ok(result) = sim.timeout(spec.chaos, chaos).await {
         result?;
     }
 
@@ -139,28 +126,28 @@ async fn phases(
     sim.lift_faults();
     let liveness = all(
         Phase::Quiet,
-        workloads.iter_mut().map(|w| (w.name(), w.liveness(&ctx))),
+        workloads.iter_mut().map(|w| (w.name(), w.liveness(&sim))),
     );
-    within(&ctx, Phase::Quiet, spec.quiet, liveness).await?;
+    within(&sim, Phase::Quiet, spec.quiet, liveness).await?;
 
     trace!(Info, "CheckPhase");
     let check = all(
         Phase::Check,
-        workloads.iter_mut().map(|w| (w.name(), w.check(&ctx))),
+        workloads.iter_mut().map(|w| (w.name(), w.check(&sim))),
     );
-    within(&ctx, Phase::Check, PHASE_DEADLINE, check).await?;
+    within(&sim, Phase::Check, PHASE_DEADLINE, check).await?;
     trace!(Info, "TestPassed");
     Ok(())
 }
 
 /// Runs a phase, failing it if it takes longer than `after`.
 async fn within(
-    ctx: &Ctx,
+    sim: &SimControl,
     phase: Phase,
     after: Duration,
     phase_future: impl Future<Output = Result<(), Failure>>,
 ) -> Result<(), Failure> {
-    ctx.timeout(after, phase_future)
+    sim.timeout(after, phase_future)
         .await
         .unwrap_or(Err(Failure::Deadline { phase, after }))
 }
@@ -209,11 +196,11 @@ mod tests {
     struct KillAnything;
 
     impl Workload for KillAnything {
-        async fn start(&mut self, ctx: &Ctx, sim: &SimControl) -> WorkloadResult {
+        async fn start(&mut self, sim: &SimControl) -> WorkloadResult {
             loop {
-                ctx.sleep(Duration::from_millis(100)).await;
+                sim.sleep(Duration::from_millis(100)).await;
                 let machines = sim.machines();
-                let machine = machines[ctx.rng().range(0..machines.len())];
+                let machine = machines[sim.fault_rng().range(0..machines.len())];
                 sim.kill(machine, KillType::Crash);
             }
         }
@@ -223,13 +210,13 @@ mod tests {
     struct EndlessSetup;
 
     impl Workload for EndlessSetup {
-        async fn setup(&mut self, ctx: &Ctx) -> WorkloadResult {
+        async fn setup(&mut self, sim: &SimControl) -> WorkloadResult {
             loop {
-                ctx.sleep(Duration::from_secs(1)).await;
+                sim.sleep(Duration::from_secs(1)).await;
             }
         }
 
-        async fn start(&mut self, _: &Ctx, _: &SimControl) -> WorkloadResult {
+        async fn start(&mut self, _: &SimControl) -> WorkloadResult {
             pending().await
         }
     }
@@ -245,7 +232,8 @@ mod tests {
     }
 
     #[test]
-    fn fault_workloads_cant_reach_the_harness_machine() {
+    /// A fault workload may kill every machine, and the run still ends.
+    fn killing_any_machine_never_stops_the_run() {
         let spec = spec(|sim| {
             for zone in ["a", "b"] {
                 let m = sim.add_machine(zone, 0);

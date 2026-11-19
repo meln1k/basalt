@@ -789,27 +789,3 @@ fn lift_faults_restores_every_disk() {
         write(&disk, "b", &[1; 10_000], true).await;
     });
 }
-
-#[test]
-fn disk_faults_refuse_a_protected_machines_disks() {
-    let faults: [fn(&SimControl, basalt_env::DiskId); 3] = [
-        |ctrl, disk| ctrl.fill_disk(disk),
-        |ctrl, disk| ctrl.set_disk_errors(disk, 1.0),
-        |ctrl, disk| ctrl.set_bit_flips(disk, 1.0),
-    ];
-    for fault in faults {
-        let sim = Sim::new(0);
-        let ctrl = sim.control();
-        // The protected machine's disk isn't the first one, so a lookup by index would miss it.
-        let [open, protected] = ["open", "protected"].map(|zone| ctrl.add_machine(zone, 2));
-        ctrl.protect(protected);
-        fault(&ctrl, ctrl.disks(open)[1]);
-        let disk = ctrl.disks(protected)[1];
-        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fault(&ctrl, disk)));
-        let message = *refused.unwrap_err().downcast::<String>().unwrap();
-        assert!(
-            message.contains("which is protected from faults"),
-            "{message}"
-        );
-    }
-}

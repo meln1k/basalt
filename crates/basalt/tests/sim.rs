@@ -61,7 +61,7 @@ fn run_prints_the_trace_seed_commit_and_unseed_and_replays_exactly() {
         assert!(text.lines().any(|l| l == line), "no {line:?} in:\n{text}");
     }
     assert!(text.contains(" pong Info Pong n=0"), "{text}");
-    assert!(text.contains(" harness Info MachineKilled "), "{text}");
+    assert!(text.contains(" - Info MachineKilled "), "{text}");
     assert!(text.contains("unseed: 0x"), "{text}");
 
     // Another process, the same seed: the identical trace and unseed.
@@ -284,7 +284,7 @@ fn planted_bug_demo(test: &str, seed: u64, violation: &[&str]) {
 fn skip_writeback_is_caught_by_the_linearizability_checker() {
     planted_bug_demo(
         "register-skip-writeback",
-        9,
+        1,
         &[
             "linearizability violation on key",
             "no operation can follow these",
@@ -297,7 +297,7 @@ fn skip_writeback_is_caught_by_the_linearizability_checker() {
 fn ack_before_sync_is_caught_by_the_durability_checker() {
     planted_bug_demo(
         "register-ack-before-sync",
-        71,
+        40,
         &["durability violation on key", "losing acknowledged writes"],
     );
 }

@@ -17,8 +17,13 @@
 //! hot key is soon overwritten, but one to a fresh key stays lost, for the durability check's
 //! final reads to see.
 //!
-//! Each client writes values that name it and number its operations, so every write is unique,
-//! which the checkers need. Attrition never wipes a replica ([`Wipes::Off`]): a wiped
+//! The clients act through one process on a machine of their own, which faults hit like the
+//! replicas': partitions and clogs cut it off, kills drop the requests it has in flight, and
+//! BUGGIFY delays its timers. Each client writes values that name it and number its
+//! operations, so every write is unique, which the checkers need. Each `Client` built takes a
+//! fresh writer id, so a client rebuilt after its process reboots never reuses a tag.
+//!
+//! Attrition never wipes a replica ([`Wipes::Off`]): a wiped
 //! replica comes back empty, and the register can't rebuild it, so it would lose acknowledged
 //! writes through no planted bug.
 
@@ -27,7 +32,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
-use basalt_env::{Ctx, Duration, SocketAddr};
+use basalt_env::{Duration, SocketAddr};
 use basalt_sim::SimControl;
 use toy_register::{Bugs, Client, DEFAULT_PORT, ReplicaConfig, run_replica};
 
@@ -36,7 +41,7 @@ use crate::checker::{
     check_register_linearizability,
 };
 use crate::faults::{self, Wipes};
-use crate::{Entry, History, Outcome, TestSpec, Workload, WorkloadResult, Workloads};
+use crate::{Entry, History, Outcome, Process, TestSpec, Workload, WorkloadResult, Workloads};
 
 /// The register with no planted bug.
 pub const REGISTER: TestSpec = TestSpec {
@@ -90,7 +95,7 @@ const HOT_PROBABILITY: f64 = 0.95;
 const LIVENESS_KEY: u64 = HOT_KEYS;
 /// The first fresh key. Fresh keys are handed out in order from here.
 const FIRST_FRESH: u64 = LIVENESS_KEY + 1;
-/// The writer id of the clients the quiet and check phases use.
+/// The client id the quiet phase's operations record.
 const CHECKER: u64 = CLIENTS;
 /// How long a chaos-phase operation may take before the client gives up on it, leaving it
 /// indeterminate. A few of the client's per-replica request timeouts.
@@ -150,81 +155,105 @@ fn build(sim: &SimControl, bugs: Bugs) -> Workloads {
             SocketAddr::new(sim.ip(machine), DEFAULT_PORT)
         })
         .collect();
-    let history = History::new();
+    let clients = Clients {
+        process: Process::add(sim, sim.add_machine("clients", 0), "clients"),
+        replicas: replicas.into(),
+        bugs,
+        writers: Rc::default(),
+        history: History::new(),
+    };
     let next_fresh = Rc::new(Cell::new(FIRST_FRESH));
     let mut workloads = Workloads::new();
     faults::add(&mut workloads, sim, Wipes::Off);
     for id in 0..CLIENTS {
         workloads.add(ChaosClient {
-            id,
-            replicas: replicas.clone(),
-            bugs,
-            history: history.clone(),
+            client: clients.client(id),
             next_fresh: next_fresh.clone(),
         });
     }
-    workloads.add(Checks {
-        replicas,
-        bugs,
-        history,
-    });
+    workloads.add(Checks { clients });
     workloads
 }
 
-/// A register client that records each operation in a history.
-struct RecordingClient {
-    id: u64,
-    client: Client,
+/// What every client of a run shares: the process they act through, the replicas, and the
+/// history they record.
+#[derive(Clone)]
+struct Clients {
+    process: Process,
+    replicas: Rc<[SocketAddr]>,
+    bugs: Bugs,
+    /// The next writer id to hand out.
+    writers: Rc<Cell<u64>>,
     history: History<Op, Out>,
 }
 
-impl RecordingClient {
-    fn new(
-        ctx: &Ctx,
-        id: u64,
-        replicas: &[SocketAddr],
-        bugs: Bugs,
-        history: &History<Op, Out>,
-    ) -> Self {
+impl Clients {
+    /// A register client for the process's current incarnation, with a writer id no other
+    /// client has had.
+    fn register_client(&self) -> Client {
+        let writer = self.writers.get();
+        self.writers.set(writer + 1);
+        let replicas = self.replicas.to_vec();
+        Client::new(self.process.ctx(), replicas, writer, self.bugs)
+    }
+
+    fn client(&self, id: u64) -> RecordingClient {
         RecordingClient {
             id,
-            client: Client::new(ctx.clone(), replicas.to_vec(), id, bugs),
-            history: history.clone(),
+            clients: self.clone(),
+            client: None,
         }
+    }
+}
+
+/// A register client that records each operation in a history, and follows the clients'
+/// process across reboots.
+struct RecordingClient {
+    id: u64,
+    clients: Clients,
+    /// The client for one incarnation of the process.
+    client: Option<(u64, Client)>,
+}
+
+impl RecordingClient {
+    /// The client for the process's current incarnation, built anew after a reboot.
+    fn client(&mut self) -> &mut Client {
+        let incarnation = self.clients.process.incarnation();
+        if self.client.as_ref().is_none_or(|(i, _)| *i != incarnation) {
+            self.client = Some((incarnation, self.clients.register_client()));
+        }
+        &mut self.client.as_mut().expect("just set").1
     }
 
     /// Writes this client's value numbered `seq` to `key`. Dropped unfinished, the write stays
     /// indeterminate.
-    async fn write(&mut self, ctx: &Ctx, key: u64, seq: u64) -> Value {
+    async fn write(&mut self, sim: &SimControl, key: u64, seq: u64) -> Value {
         let value = Value {
             client: self.id,
             seq,
         };
-        let call = self
-            .history
-            .invoke(ctx, self.id, RegisterOp::Write(key, value));
-        self.client.write(key, value.encode()).await;
-        call.ok(ctx, RegisterOutput::Written);
+        let history = self.clients.history.clone();
+        let call = history.invoke(sim, self.id, RegisterOp::Write(key, value));
+        self.client().write(key, value.encode()).await;
+        call.ok(sim, RegisterOutput::Written);
         value
     }
 
     /// Reads `key`, or fails if it holds a value no client wrote. Dropped unfinished, the read
     /// stays indeterminate.
-    async fn read(&mut self, ctx: &Ctx, key: u64) -> Result<Option<Value>, String> {
-        let call = self.history.invoke(ctx, self.id, RegisterOp::Read(key));
-        let read = self.client.read(key).await;
+    async fn read(&mut self, sim: &SimControl, key: u64) -> Result<Option<Value>, String> {
+        let history = self.clients.history.clone();
+        let call = history.invoke(sim, self.id, RegisterOp::Read(key));
+        let read = self.client().read(key).await;
         let value = read.as_deref().map(Value::decode).transpose()?;
-        call.ok(ctx, RegisterOutput::Read(value));
+        call.ok(sim, RegisterOutput::Read(value));
         Ok(value)
     }
 }
 
 /// One client in the chaos phase: reads and writes random keys, recording each operation.
 struct ChaosClient {
-    id: u64,
-    replicas: Vec<SocketAddr>,
-    bugs: Bugs,
-    history: History<Op, Out>,
+    client: RecordingClient,
     /// The next fresh key, shared by every client.
     next_fresh: Rc<Cell<u64>>,
 }
@@ -234,28 +263,32 @@ impl Workload for ChaosClient {
         "register-client"
     }
 
-    async fn start(&mut self, ctx: &Ctx, _: &SimControl) -> WorkloadResult {
-        let mut client =
-            RecordingClient::new(ctx, self.id, &self.replicas, self.bugs, &self.history);
+    async fn start(&mut self, sim: &SimControl) -> WorkloadResult {
+        let client = &mut self.client;
         for seq in 0.. {
-            let is_write = ctx.rng().bool(0.5);
-            let key = if ctx.rng().bool(HOT_PROBABILITY) {
-                ctx.rng().range(0..HOT_KEYS)
+            // The `ctx` stream, which a dead process's `Ctx` still draws from.
+            let ctx = client.clients.process.ctx();
+            let rng = ctx.rng();
+            let is_write = rng.bool(0.5);
+            let key = if rng.bool(HOT_PROBABILITY) {
+                rng.range(0..HOT_KEYS)
             } else if is_write {
                 let key = self.next_fresh.get();
                 self.next_fresh.set(key + 1);
                 key
             } else {
                 // A fresh key, maybe the next one, which no write has taken yet.
-                ctx.rng().range(FIRST_FRESH..=self.next_fresh.get())
+                rng.range(FIRST_FRESH..=self.next_fresh.get())
             };
-            // An operation that times out is dropped, which leaves it indeterminate.
+            let pause = rng.range(Duration::ZERO..=MAX_PAUSE);
+            // An operation that times out is dropped, which leaves it indeterminate. So does
+            // one whose process is killed: it never returns, and times out.
             if is_write {
-                let _ = ctx.timeout(OP_TIMEOUT, client.write(ctx, key, seq)).await;
-            } else if let Ok(read) = ctx.timeout(OP_TIMEOUT, client.read(ctx, key)).await {
+                let _ = sim.timeout(OP_TIMEOUT, client.write(sim, key, seq)).await;
+            } else if let Ok(read) = sim.timeout(OP_TIMEOUT, client.read(sim, key)).await {
                 read?;
             }
-            ctx.sleep(ctx.rng().range(Duration::ZERO..=MAX_PAUSE)).await;
+            sim.sleep(pause).await;
         }
         Ok(())
     }
@@ -263,9 +296,7 @@ impl Workload for ChaosClient {
 
 /// The quiet and check phases: a fresh write and read, then the checkers.
 struct Checks {
-    replicas: Vec<SocketAddr>,
-    bugs: Bugs,
-    history: History<Op, Out>,
+    clients: Clients,
 }
 
 impl Workload for Checks {
@@ -273,17 +304,17 @@ impl Workload for Checks {
         "register-checks"
     }
 
-    async fn start(&mut self, _: &Ctx, _: &SimControl) -> WorkloadResult {
+    async fn start(&mut self, _: &SimControl) -> WorkloadResult {
         Ok(())
     }
 
     /// Writes a value to a key no chaos-phase operation used and reads it back, within the
-    /// quiet phase's deadline.
-    async fn liveness(&mut self, ctx: &Ctx) -> WorkloadResult {
-        let mut client =
-            RecordingClient::new(ctx, CHECKER, &self.replicas, self.bugs, &self.history);
-        let value = client.write(ctx, LIVENESS_KEY, 0).await;
-        let read = client.read(ctx, LIVENESS_KEY).await?;
+    /// quiet phase's deadline. Every fault is lifted by now, so the clients' process stays
+    /// alive.
+    async fn liveness(&mut self, sim: &SimControl) -> WorkloadResult {
+        let mut client = self.clients.client(CHECKER);
+        let value = client.write(sim, LIVENESS_KEY, 0).await;
+        let read = client.read(sim, LIVENESS_KEY).await?;
         if read != Some(value) {
             return Err(format!("the liveness write of {value:?} read back as {read:?}").into());
         }
@@ -293,9 +324,10 @@ impl Workload for Checks {
     /// Reads every key written once more, then checks the history for linearizability and the
     /// final values for durability. The final reads stay out of the history, so a lost write
     /// is the durability checker's to report.
-    async fn check(&mut self, ctx: &Ctx) -> WorkloadResult {
-        let entries = self.history.entries();
-        let (ops, indices) = self.history.to_checker();
+    async fn check(&mut self, _: &SimControl) -> WorkloadResult {
+        let history = &self.clients.history;
+        let entries = history.entries();
+        let (ops, indices) = history.to_checker();
         let written: BTreeSet<u64> = entries
             .iter()
             .filter_map(|e| match e.input {
@@ -303,7 +335,7 @@ impl Workload for Checks {
                 RegisterOp::Read(_) => None,
             })
             .collect();
-        let mut client = Client::new(ctx.clone(), self.replicas.clone(), CHECKER, self.bugs);
+        let mut client = self.clients.register_client();
         let mut finals = Vec::new();
         for key in written {
             let value = client.read(key).await;

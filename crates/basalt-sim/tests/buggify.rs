@@ -164,14 +164,7 @@ fn buggify_cancels_a_random_task_in_some_seeds_but_never_a_main_task() {
                 }
             })
         });
-        let h = ctrl.add_machine("harness", 0);
-        ctrl.protect(h);
-        let harness = ctrl.add_process(h, "harness", |_| Box::pin(async {}));
-        let c = harness.clone();
-        let timer = harness.spawn("timer", Priority::Default, async move {
-            c.sleep(Duration::from_secs(10)).await;
-        });
-        sim.block_on(timer).unwrap();
+        sim.block_on(ctrl.sleep(Duration::from_secs(10))).unwrap();
 
         let traced = sim.trace().iter().any(|r| r.name == "TaskCancelled");
         assert_eq!(traced, worker_dropped.get(), "seed {seed}");
@@ -215,14 +208,7 @@ fn buggify_never_cancels_a_task_someone_awaits() {
                 d.set(true);
             })
         });
-        let h = ctrl.add_machine("harness", 0);
-        ctrl.protect(h);
-        let harness = ctrl.add_process(h, "harness", |_| Box::pin(async {}));
-        let c = harness.clone();
-        let timer = harness.spawn("timer", Priority::Default, async move {
-            c.sleep(Duration::from_secs(120)).await;
-        });
-        sim.block_on(timer).unwrap();
+        sim.block_on(ctrl.sleep(Duration::from_secs(120))).unwrap();
         assert!(done.get(), "seed {seed}");
         let names: Vec<_> = sim
             .trace()

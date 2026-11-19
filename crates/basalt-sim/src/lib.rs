@@ -23,9 +23,12 @@
 //! with its own probability, until [`SimControl::lift_faults`] turns BUGGIFY off for the quiet
 //! phase. The simulator has two sites of its own: one makes a `sleep` end up
 //! to the `max_buggified_delay` knob late, and one now and then cancels a random detached task,
-//! except a process's main task and tasks on protected machines. [`Sim::coverage`] reports which sites
-//! and probes a run reached. Each seed's [`Swarm`] config, drawn from the `faults` stream,
+//! except a process's main task. [`Sim::coverage`] reports which sites and probes a run reached. Each seed's [`Swarm`] config, drawn from the `faults` stream,
 //! enables a subset of fault types and randomizes a subset of knobs.
+//!
+//! A test drives a run from outside every process with [`Sim::block_on`]: its future can't be
+//! killed or cancelled, and waits on the world's own clock with [`SimControl::sleep`], so no
+//! machine needs to be spared from faults to keep a run going.
 //!
 //! A run fails when no task can make progress ([`SimError::Hang`]) or when any code records an
 //! `Error` trace event ([`SimError::ErrorTrace`]). A panic in a task propagates out of the run.
@@ -42,15 +45,18 @@ mod world;
 
 use std::cell::Ref;
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, ThreadId};
 
 use basalt_env::backend::LocalBoxFuture;
 use basalt_env::world::WorldGuard;
 use basalt_env::{
-    Ctx, DiskId, Duration, Instant, IpAddr, Priority, Rng, SystemTime, Task, TaskId, trace,
+    Ctx, DiskId, Duration, Elapsed, Instant, IpAddr, Priority, Rng, SystemTime, TaskId, trace,
 };
 
 pub use crate::buggify::{BUGGIFY_SWITCH_PROBABILITY, Coverage, SiteHits};
@@ -89,22 +95,35 @@ impl Sim {
 
     /// Runs until every task has ended.
     pub fn run(&self) -> Result<(), SimError> {
-        self.world
-            .run_while(|| self.world.executor.has_live_tasks())
+        let done = || (!self.world.executor.has_live_tasks()).then_some(());
+        self.world.run_until(done, || false)
     }
 
-    /// Runs until `task` completes and returns its output. Other tasks may still be live.
-    pub fn block_on<T>(&self, mut task: Task<T>) -> Result<T, SimError> {
-        let mut output = None;
-        self.world.run_while(|| {
-            if let Poll::Ready(out) =
-                Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()))
-            {
-                output = Some(out);
-            }
-            output.is_none()
-        })?;
-        Ok(output.expect("run_while stops only once the task completed"))
+    /// Runs until `future` completes and returns its output. Other tasks may still be live.
+    ///
+    /// `future` runs outside every process, as a test's driver: the run loop polls it on this
+    /// thread whenever something wakes it, ahead of any ready task. No kill or fault can drop it.
+    /// It acts as a process by awaiting futures from that process's `Ctx`, and waits on the
+    /// world's clock with [`SimControl::sleep`]. Panics if it is woken from another thread.
+    pub fn block_on<F: Future>(&self, future: F) -> Result<F::Output, SimError> {
+        let mut future = pin!(future);
+        let wake = Arc::new(DriverWake {
+            woken: AtomicBool::new(true),
+            thread: thread::current().id(),
+        });
+        let waker = Waker::from(wake.clone());
+        self.world.run_until(
+            || {
+                if !wake.woken.swap(false, Ordering::Relaxed) {
+                    return None;
+                }
+                match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                    Poll::Ready(output) => Some(output),
+                    Poll::Pending => None,
+                }
+            },
+            || wake.woken.load(Ordering::Relaxed),
+        )
     }
 
     /// The current virtual time.
@@ -185,7 +204,6 @@ impl SimControl {
     /// machine: it is dropped as soon as its current poll ends, before any other task runs.
     /// Killing a machine that's down applies only what `kind` does to its disks.
     pub fn kill(&self, machine: MachineId, kind: KillType) {
-        self.refuse_if_protected(machine, "kill");
         self.world.kill(machine, kind);
     }
 
@@ -193,7 +211,6 @@ impl SimControl {
     /// rerunning its entry point. A machine that's up is first killed with
     /// [`KillType::Crash`].
     pub fn reboot(&self, machine: MachineId) {
-        self.refuse_if_protected(machine, "reboot");
         self.world.reboot(machine);
     }
 
@@ -202,20 +219,9 @@ impl SimControl {
         self.world.machines.is_up(machine)
     }
 
-    /// Every machine added so far that isn't [protected](SimControl::protect), up or down, in
-    /// the order they were added. Fault workloads pick their targets from these.
+    /// Every machine added so far, up or down, in the order they were added.
     pub fn machines(&self) -> Vec<MachineId> {
-        let machines = &self.world.machines;
-        let mut ids = machines.ids();
-        ids.retain(|&m| !machines.is_protected(m));
-        ids
-    }
-
-    /// Protects `machine` from faults: it's left out of [`machines`](SimControl::machines),
-    /// and killing, rebooting, or skewing the clocks of it panics. The test harness protects
-    /// the machine its workloads run on, since a run can't end once that machine is gone.
-    pub fn protect(&self, machine: MachineId) {
-        self.world.machines.protect(machine);
+        self.world.machines.ids()
     }
 
     /// Lifts every fault, for a test's quiet phase: heals the network as
@@ -249,21 +255,6 @@ impl SimControl {
         self.world.seed
     }
 
-    fn refuse_if_protected(&self, machine: MachineId, fault: &str) {
-        assert!(
-            !self.world.machines.is_protected(machine),
-            "{fault} on {machine:?}, which is protected from faults"
-        );
-    }
-
-    /// Like [`refuse_if_protected`](SimControl::refuse_if_protected), for the machine that has
-    /// `disk`. A disk no machine has is left for the fault itself to reject.
-    fn refuse_disk_if_protected(&self, disk: DiskId, fault: &str) {
-        if let Some(machine) = self.world.machines.disk_owner(disk) {
-            self.refuse_if_protected(machine, fault);
-        }
-    }
-
     /// The disks of `machine` right now. A [`KillType::Wipe`] replaces them with new ones, and a
     /// [`KillType::DiskFail`] leaves none.
     pub fn disks(&self, machine: MachineId) -> Rc<[DiskId]> {
@@ -273,27 +264,22 @@ impl SimControl {
     /// Fills `disk`: until [`restore_disks`](SimControl::restore_disks), creating a file and
     /// anything that makes a file longer fail with `StorageFull` (`ENOSPC`), and
     /// [`Disk::space`](basalt_env::Disk::space) reports nothing available. Panics if no machine
-    /// has `disk`, or if its machine is [protected](SimControl::protect).
+    /// has `disk`.
     pub fn fill_disk(&self, disk: DiskId) {
-        self.refuse_disk_if_protected(disk, "fill_disk");
         self.world.disks.fill(disk);
     }
 
     /// Makes each read and write on `disk` fail with `EIO` with probability `p`, until
     /// [`restore_disks`](SimControl::restore_disks). A failed write changes nothing. Panics if
-    /// no machine has `disk`, if its machine is [protected](SimControl::protect), or unless
-    /// `0 <= p <= 1`.
+    /// no machine has `disk`, or unless `0 <= p <= 1`.
     pub fn set_disk_errors(&self, disk: DiskId, p: f64) {
-        self.refuse_disk_if_protected(disk, "set_disk_errors");
         self.world.disks.set_io_errors(disk, p);
     }
 
     /// Makes each read on `disk` return one flipped bit with probability `p`, until
     /// [`restore_disks`](SimControl::restore_disks). The data on the disk stays intact. Panics
-    /// if no machine has `disk`, if its machine is [protected](SimControl::protect), or unless
-    /// `0 <= p <= 1`.
+    /// if no machine has `disk`, or unless `0 <= p <= 1`.
     pub fn set_bit_flips(&self, disk: DiskId, p: f64) {
-        self.refuse_disk_if_protected(disk, "set_bit_flips");
         self.world.disks.set_bit_flips(disk, p);
     }
 
@@ -315,14 +301,12 @@ impl SimControl {
     ///
     /// Timers already set on the machine move to the new rate.
     pub fn set_clock_drift(&self, machine: MachineId, ppm: i32) {
-        self.refuse_if_protected(machine, "set_clock_drift");
         self.world.machines.clock(machine).set_drift(ppm);
     }
 
     /// Jumps `machine`'s wall clock, forward or back, so that it reads `to` now. Its monotonic
     /// clock is unchanged.
     pub fn set_wall_clock(&self, machine: MachineId, to: SystemTime) {
-        self.refuse_if_protected(machine, "set_wall_clock");
         self.world.machines.clock(machine).set_wall(to);
     }
 
@@ -334,6 +318,35 @@ impl SimControl {
     /// The current virtual time.
     pub fn now(&self) -> Instant {
         self.world.clock.now()
+    }
+
+    /// A future that completes after `d` of virtual time, on the world's clock rather than a
+    /// machine's: no clock drift or `buggify!` moves it, so a test driver or fault workload
+    /// timed by it depends only on the seed. A `d` too long to represent never completes.
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = ()> + use<> {
+        let deadline = self.now().checked_add(d).unwrap_or(Instant::MAX);
+        self.world.clock.sleep_until(deadline)
+    }
+
+    /// Runs `future` until it completes or `d` of virtual time passes, as
+    /// [`sleep`](SimControl::sleep) measures it. If time runs out first, `future` is dropped
+    /// with the returned future.
+    pub fn timeout<F: Future>(
+        &self,
+        d: Duration,
+        future: F,
+    ) -> impl Future<Output = Result<F::Output, Elapsed>> + use<F> {
+        let sleep = self.sleep(d);
+        async move {
+            let (mut future, mut sleep) = (pin!(future), pin!(sleep));
+            poll_fn(move |cx| {
+                if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                    return Poll::Ready(Ok(output));
+                }
+                sleep.as_mut().poll(cx).map(|()| Err(Elapsed))
+            })
+            .await
+        }
     }
 
     // Network
@@ -468,6 +481,27 @@ impl fmt::Display for BlockedTask {
             self.priority,
             self.id.get()
         )
+    }
+}
+
+/// Wakes the future a test drives with [`Sim::block_on`].
+struct DriverWake {
+    woken: AtomicBool,
+    thread: ThreadId,
+}
+
+impl Wake for DriverWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        assert!(
+            thread::current().id() == self.thread,
+            "a simulation's driver was woken from another thread, which makes the simulation \
+             nondeterministic"
+        );
+        self.woken.store(true, Ordering::Relaxed);
     }
 }
 

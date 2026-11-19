@@ -13,7 +13,7 @@ use basalt_sim::SimControl;
 use futures_io::{AsyncRead, AsyncWrite};
 
 use crate::faults;
-use crate::workload::{TestSpec, Workload, WorkloadResult, Workloads};
+use crate::workload::{Process, TestSpec, Workload, WorkloadResult, Workloads};
 
 /// Every fault workload against a mesh of nodes; every seed passes.
 pub const FAULTS: TestSpec = TestSpec {
@@ -55,12 +55,11 @@ fn build(sim: &SimControl) -> Workloads {
             Box::pin(node(ctx, i, peers.clone()))
         });
     }
+    // The quiet phase asks each node for its check from here. Faults hit it too.
+    let prober = Process::add(sim, sim.add_machine("prober", 0), "prober");
     let mut workloads = Workloads::new();
     faults::add(&mut workloads, sim, faults::Wipes::On);
-    workloads.add(Mesh {
-        sim: sim.clone(),
-        peers,
-    });
+    workloads.add(Mesh { prober, peers });
     workloads
 }
 
@@ -165,7 +164,7 @@ async fn write_disk(ctx: &Ctx) -> io::Result<()> {
 
 /// Lets the nodes run through the chaos phase, then checks that every fault was lifted.
 struct Mesh {
-    sim: SimControl,
+    prober: Process,
     peers: Rc<[SocketAddr]>,
 }
 
@@ -174,16 +173,18 @@ impl Workload for Mesh {
         "mesh"
     }
 
-    async fn start(&mut self, _: &Ctx, _: &SimControl) -> WorkloadResult {
+    async fn start(&mut self, _: &SimControl) -> WorkloadResult {
         std::future::pending().await
     }
 
-    async fn liveness(&mut self, ctx: &Ctx) -> WorkloadResult {
-        for machine in self.sim.machines() {
-            if !self.sim.is_up(machine) {
+    async fn liveness(&mut self, sim: &SimControl) -> WorkloadResult {
+        for machine in sim.machines() {
+            if !sim.is_up(machine) {
                 return Err(format!("{machine:?} is still down").into());
             }
         }
+        // Every machine is up, so this incarnation stays alive to the end of the run.
+        let ctx = &self.prober.ctx();
         for (i, &addr) in self.peers.iter().enumerate() {
             let mut failure = None;
             for _ in 0..CHECK_ATTEMPTS {

@@ -18,7 +18,7 @@ pub mod sweep;
 mod workload;
 
 pub use history::{Call, Entry, Event, History, Outcome};
-pub use workload::{TestSpec, Workload, WorkloadResult, Workloads};
+pub use workload::{Process, TestSpec, Workload, WorkloadResult, Workloads};
 
 /// The commit this build came from, with `-dirty` if its sources differed from it, or `unknown`
 /// outside a git checkout. A failing seed reproduces only on this commit.

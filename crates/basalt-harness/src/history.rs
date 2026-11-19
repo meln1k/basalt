@@ -9,12 +9,13 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-use basalt_env::{Ctx, Instant};
+use basalt_env::Instant;
+use basalt_sim::SimControl;
 
 use crate::checker;
 
 /// When an event happened: its position among all events of its history, and the virtual time
-/// on the recording process's clock.
+/// on the world's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
     pub position: u64,
@@ -81,12 +82,12 @@ struct Inner<I, O> {
 }
 
 impl<I, O> Inner<I, O> {
-    fn event(&mut self, ctx: &Ctx) -> Event {
+    fn event(&mut self, sim: &SimControl) -> Event {
         let position = self.next_position;
         self.next_position += 1;
         Event {
             position,
-            time: ctx.now(),
+            time: sim.now(),
         }
     }
 }
@@ -101,11 +102,11 @@ impl<I, O> History<I, O> {
         }
     }
 
-    /// Records that `client` invoked `input` now, on `ctx`'s clock. Finish the returned
-    /// [`Call`] when the response arrives; dropping it leaves the operation indeterminate.
-    pub fn invoke(&self, ctx: &Ctx, client: u64, input: I) -> Call<I, O> {
+    /// Records that `client` invoked `input` now. Finish the returned [`Call`] when the
+    /// response arrives; dropping it leaves the operation indeterminate.
+    pub fn invoke(&self, sim: &SimControl, client: u64, input: I) -> Call<I, O> {
         let mut inner = self.inner.borrow_mut();
-        let call = inner.event(ctx);
+        let call = inner.event(sim);
         inner.entries.push(Entry {
             client,
             input,
@@ -127,9 +128,9 @@ impl<I, O> History<I, O> {
         self.len() == 0
     }
 
-    fn finish(&self, index: usize, ctx: &Ctx, outcome: impl FnOnce(Event) -> Outcome<O>) {
+    fn finish(&self, index: usize, sim: &SimControl, outcome: impl FnOnce(Event) -> Outcome<O>) {
         let mut inner = self.inner.borrow_mut();
-        let at = inner.event(ctx);
+        let at = inner.event(sim);
         inner.entries[index].outcome = outcome(at);
     }
 }
@@ -200,17 +201,17 @@ pub struct Call<I, O> {
 }
 
 impl<I, O> Call<I, O> {
-    /// Records that the operation returned `output` now, on `ctx`'s clock.
-    pub fn ok(self, ctx: &Ctx, output: O) {
+    /// Records that the operation returned `output` now.
+    pub fn ok(self, sim: &SimControl, output: O) {
         self.history
-            .finish(self.index, ctx, |at| Outcome::Ok { output, at });
+            .finish(self.index, sim, |at| Outcome::Ok { output, at });
     }
 
-    /// Records that the operation failed now, on `ctx`'s clock, and is known to have had no
-    /// effect. If it might have taken effect, drop the call instead.
-    pub fn fail(self, ctx: &Ctx) {
+    /// Records that the operation failed now, and is known to have had no effect. If it might
+    /// have taken effect, drop the call instead.
+    pub fn fail(self, sim: &SimControl) {
         self.history
-            .finish(self.index, ctx, |at| Outcome::Failed { at });
+            .finish(self.index, sim, |at| Outcome::Failed { at });
     }
 }
 
@@ -230,22 +231,16 @@ mod tests {
     type Op = RegisterOp<&'static str, u32>;
     type Out = RegisterOutput<u32>;
 
-    fn ctx(sim: &Sim) -> Ctx {
-        let ctrl = sim.control();
-        let machine = ctrl.add_machine("client", 0);
-        ctrl.add_process(machine, "client", |_| Box::pin(async {}))
-    }
-
     #[test]
     fn events_get_positions_in_recording_order() {
         let sim = Sim::new(0);
-        let ctx = ctx(&sim);
+        let ctrl = sim.control();
         let history: History<Op, Out> = History::new();
-        let write = history.invoke(&ctx, 1, RegisterOp::Write("k", 1));
-        let read = history.invoke(&ctx, 2, RegisterOp::Read("k"));
-        let lost = history.invoke(&ctx, 3, RegisterOp::Write("k", 2));
-        read.ok(&ctx, RegisterOutput::Read(None));
-        write.fail(&ctx);
+        let write = history.invoke(&ctrl, 1, RegisterOp::Write("k", 1));
+        let read = history.invoke(&ctrl, 2, RegisterOp::Read("k"));
+        let lost = history.invoke(&ctrl, 3, RegisterOp::Write("k", 2));
+        read.ok(&ctrl, RegisterOutput::Read(None));
+        write.fail(&ctrl);
         drop(lost);
 
         let entries = history.entries();
@@ -275,14 +270,14 @@ mod tests {
     #[test]
     fn the_checker_orders_events_at_one_instant_by_position() {
         let sim = Sim::new(0);
-        let ctx = ctx(&sim);
+        let ctrl = sim.control();
         let history: History<Op, Out> = History::new();
         history
-            .invoke(&ctx, 1, RegisterOp::Write("k", 1))
-            .ok(&ctx, RegisterOutput::Written);
+            .invoke(&ctrl, 1, RegisterOp::Write("k", 1))
+            .ok(&ctrl, RegisterOutput::Written);
         history
-            .invoke(&ctx, 2, RegisterOp::Read("k"))
-            .ok(&ctx, RegisterOutput::Read(None));
+            .invoke(&ctrl, 2, RegisterOp::Read("k"))
+            .ok(&ctrl, RegisterOutput::Read(None));
         assert!(
             history
                 .entries()
