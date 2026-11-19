@@ -21,8 +21,8 @@ pub(super) type InodeRef = Rc<RefCell<Inode>>;
 pub(super) struct State {
     live: Tree,
     durable: Tree,
-    /// The file paths whose live entry may differ from their durable one. Every other path has
-    /// the same entry, or none, in both trees.
+    /// Exactly the file paths whose live entry differs from their durable one: a different
+    /// inode, or a file in one tree and none in the other.
     pending: BTreeSet<String>,
 }
 
@@ -87,15 +87,6 @@ impl Tree {
             })
     }
 
-    /// Whether `other` has the same files directly in `dir`.
-    fn same_files_in(&self, other: &Tree, dir: &str) -> bool {
-        self.files_in(dir)
-            .map(|(name, inode)| (name, Rc::as_ptr(inode)))
-            .eq(other
-                .files_in(dir)
-                .map(|(name, inode)| (name, Rc::as_ptr(inode))))
-    }
-
     /// Whether every directory above every name is in `dirs`.
     fn is_connected(&self) -> bool {
         self.dirs
@@ -110,6 +101,11 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
 }
 
+/// Whether `a` and `b` have the same file at `path`, or both have none.
+fn same_file(a: &Tree, b: &Tree, path: &str) -> bool {
+    a.files.get(path).map(Rc::as_ptr) == b.files.get(path).map(Rc::as_ptr)
+}
+
 /// What every path directly in `dir` starts with.
 fn prefix(dir: &str) -> String {
     if dir.is_empty() {
@@ -121,7 +117,7 @@ fn prefix(dir: &str) -> String {
 
 impl State {
     /// What processes see. Its names change only through [`State::insert_file`] and
-    /// [`State::remove_file`], which keep `pending`.
+    /// [`State::remove_file`], which keep `pending` exact.
     pub(super) fn live(&self) -> &Tree {
         &self.live
     }
@@ -130,18 +126,30 @@ impl State {
     pub(super) fn insert_file(&mut self, path: &str, inode: InodeRef) {
         self.live.create_parents(path);
         self.live.files.insert(path.to_owned(), inode);
-        self.pending.insert(path.to_owned());
+        self.update_pending(path);
     }
 
     /// Removes the live file at `path`.
     pub(super) fn remove_file(&mut self, path: &str) {
         self.live.files.remove(path);
-        self.pending.insert(path.to_owned());
+        self.update_pending(path);
+    }
+
+    /// Records whether `path`'s live and durable entries now differ.
+    fn update_pending(&mut self, path: &str) {
+        if same_file(&self.live, &self.durable, path) {
+            self.pending.remove(path);
+        } else if !self.pending.contains(path) {
+            self.pending.insert(path.to_owned());
+        }
     }
 
     /// Makes durable the files directly in `dir` and every directory on the path to it, as
     /// `sync_dir` does. `dir` must be a live directory.
     pub(super) fn sync_dir(&mut self, dir: &str) {
+        // Only pending names can differ, so this costs only what changed under `dir` since it
+        // was last synced, however many files it has.
+        let synced: Vec<String> = self.pending_in(dir).cloned().collect();
         let State {
             live,
             durable,
@@ -149,20 +157,13 @@ impl State {
         } = self;
         if !dir.is_empty() {
             for d in parents(dir).chain([dir]) {
-                // Its name in its parent is now a directory, whatever it was before.
+                // Its name in its parent is now a directory, whatever it was before. A durable
+                // file there was pending, since the live name is a directory, and no longer is.
                 durable.files.remove(d);
                 durable.dirs.insert(d.to_owned());
+                pending.remove(d);
             }
         }
-        // Only pending names can differ, so this costs only what changed under `dir` since it
-        // was last synced, however many files it has.
-        let prefix = prefix(dir);
-        let synced: Vec<String> = pending
-            .range(prefix.clone()..)
-            .take_while(|path| path.starts_with(&prefix))
-            .filter(|path| !path[prefix.len()..].contains('/'))
-            .cloned()
-            .collect();
         for path in synced {
             match live.files.get(&path) {
                 Some(inode) => durable.files.insert(path.clone(), inode.clone()),
@@ -172,15 +173,39 @@ impl State {
         }
     }
 
+    /// The pending paths directly in `dir`, as `sync_dir` makes them durable.
+    fn pending_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a String> + 'a {
+        let prefix = prefix(dir);
+        let skip = prefix.len();
+        self.pending
+            .range(prefix.clone()..)
+            .take_while(move |path| path.starts_with(&prefix))
+            .filter(move |path| !path[skip..].contains('/'))
+    }
+
     /// Whether `dir`'s entries, or the directory itself, aren't durable yet.
     fn dir_pending(&self, dir: &str) -> bool {
         let dir_durable = dir.is_empty() || self.durable.dirs.contains(dir);
-        !dir_durable || !self.live.same_files_in(&self.durable, dir)
+        !dir_durable || self.pending_in(dir).next().is_some()
+    }
+
+    /// Whether `pending` is exactly the paths whose live and durable entries differ. Costs
+    /// time proportional to every file on the disk.
+    fn pending_is_exact(&self) -> bool {
+        let differ: BTreeSet<&String> = self
+            .live
+            .files
+            .keys()
+            .chain(self.durable.files.keys())
+            .filter(|path| !same_file(&self.live, &self.durable, path))
+            .collect();
+        differ.into_iter().eq(&self.pending)
     }
 
     /// Drops everything not durable: some pending directories may have been flushed first,
     /// then each surviving file loses or corrupts its pending pages.
     pub(super) fn power_cut(&mut self, disk: DiskId, rng: &Rng) {
+        debug_assert!(self.pending_is_exact(), "`pending` drifted from the trees");
         // The OS may have written some directories' pending entries before the power went.
         // Parents sort before their children.
         let dirs: Vec<String> = [String::new()]
