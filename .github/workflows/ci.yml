@@ -59,3 +59,6 @@ jobs:
       - run: cargo build --release --locked --bin basalt
       - run: target/release/basalt sim check-determinism --test ping-pong --seeds 0..200
       - run: target/release/basalt sim check-determinism --test faults --seeds 0..200
+      - run: target/release/basalt sim check-determinism --test register --seeds 0..50
+      # check-determinism passes a seed that fails the same way twice, so sweep for failures too.
+      - run: target/release/basalt sim sweep --test register --seeds 0..200

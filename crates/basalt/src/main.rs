@@ -27,7 +27,12 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Server(args) => basalt_server::main(args),
         Command::Sim(command) => {
-            basalt_harness::cli::main(command, basalt_harness::selftest::TESTS)
+            let tests: Vec<_> = [
+                basalt_harness::selftest::TESTS,
+                basalt_harness::register_tests::TESTS,
+            ]
+            .concat();
+            basalt_harness::cli::main(command, &tests)
         }
     }
 }

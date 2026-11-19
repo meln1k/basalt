@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod faults;
 mod history;
 pub mod panic_hook;
+pub mod register_tests;
 pub mod runner;
 pub mod selftest;
 pub mod sweep;

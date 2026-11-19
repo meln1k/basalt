@@ -1,4 +1,5 @@
-//! `basalt sim`'s four commands, run as the shipped binary on the harness self-test.
+//! `basalt sim`'s four commands, run as the shipped binary on the harness self-test, and the
+//! planted-bug demo on the register tests.
 
 #![allow(
     clippy::disallowed_types,
@@ -33,7 +34,17 @@ fn list_shows_the_built_in_tests() {
         .lines()
         .map(|l| l.split_whitespace().next().unwrap().to_owned())
         .collect();
-    assert_eq!(names, ["ping-pong", "ping-pong-planted", "faults"]);
+    assert_eq!(
+        names,
+        [
+            "ping-pong",
+            "ping-pong-planted",
+            "faults",
+            "register",
+            "register-skip-writeback",
+            "register-ack-before-sync",
+        ]
+    );
 }
 
 #[test]
@@ -226,4 +237,80 @@ fn zero_jobs_is_rejected() {
         "0",
     ]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// The demo for one planted bug: a sweep with the bug on fails `seed`, `run --seed` reports the
+/// checker's violation, a line with every phrase of `violation`, and replays the identical trace,
+/// and the same seed passes with the bug off.
+fn planted_bug_demo(test: &str, seed: u64, violation: &[&str]) {
+    let range = format!("{seed}..{}", seed + 1);
+    let seed = seed.to_string();
+    let out = basalt(&["sim", "sweep", "--test", test, "--seeds", &range, "-j", "1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("failed seed {seed}; replay with: ")),
+        "{}",
+        stdout(&out)
+    );
+
+    let run = |test| basalt(&["sim", "run", "--test", test, "--seed", &seed]);
+    let first = run(test);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr(&first));
+    let text = stdout(&first);
+    assert!(
+        text.contains("result: FAILED: register-checks failed in the Check phase"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| violation.iter().all(|phrase| l.contains(phrase))),
+        "{text}"
+    );
+    assert_eq!(stdout(&run(test)), text);
+
+    let off = run("register");
+    assert!(off.status.success(), "{}", stdout(&off));
+    assert!(stdout(&off).lines().any(|l| l == "result: passed"));
+}
+
+// The seeds below are ones a release-build sweep found. A change to the register, the
+// simulator, or the fault workloads can move the failures to other seeds; if so, find new ones
+// with `basalt sim sweep --test <test> --seeds 0..1000` and update them. A sweep doesn't say
+// which checker failed a seed, and most ack-before-sync seeds fail linearizability first, so
+// check each candidate with `basalt sim run` for the violation the test expects.
+
+/// A read that skips its write-back lets a later read return an older value.
+#[test]
+fn skip_writeback_is_caught_by_the_linearizability_checker() {
+    planted_bug_demo(
+        "register-skip-writeback",
+        9,
+        &[
+            "linearizability violation on key",
+            "no operation can follow these",
+        ],
+    );
+}
+
+/// A power cut on a majority loses a write the replicas acknowledged before syncing it.
+#[test]
+fn ack_before_sync_is_caught_by_the_durability_checker() {
+    planted_bug_demo(
+        "register-ack-before-sync",
+        71,
+        &["durability violation on key", "losing acknowledged writes"],
+    );
+}
+
+#[test]
+fn sweep_of_the_register_with_both_bugs_off_passes() {
+    let out = basalt(&[
+        "sim", "sweep", "--test", "register", "--seeds", "0..4", "-j", "2",
+    ]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("passed: 4, failed: 0"),
+        "{}",
+        stdout(&out)
+    );
 }
