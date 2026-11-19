@@ -406,7 +406,7 @@ fn disk_operations_take_virtual_time_and_queue() {
         // 1 MiB at 1 GiB/s is about a millisecond, give or take half.
         assert!(big >= Duration::from_micros(400), "{big:?}");
 
-        // Ten small writes at once finish one after another, not together.
+        // Ten small writes at once share the disk's 4 queues, so some wait behind others.
         let file = Rc::new(file);
         let start = ctx.now();
         let tasks: Vec<_> = (0..10)
@@ -422,7 +422,8 @@ fn disk_operations_take_virtual_time_and_queue() {
             task.await;
         }
         let all = ctx.now() - start;
-        assert!(all >= Duration::from_micros(10 * 25), "{all:?}");
+        // Some queue takes at least 3 of them, each at least half of 50 µs.
+        assert!(all >= Duration::from_micros(3 * 25), "{all:?}");
     });
 }
 
@@ -730,9 +731,11 @@ fn a_sparse_file_costs_only_what_is_written() {
 }
 
 /// A handle another process holds on a killed process's disk: an operation already waiting for
-/// its turn when the kill comes fails, and changes nothing.
+/// its turn when the kill comes fails. The disk may or may not have finished it first, and one
+/// called after the kill is never submitted.
 #[test]
 fn an_operation_in_flight_when_its_process_dies_fails() {
+    let mut landed = 0;
     for seed in 0..10 {
         let node = Node::new(seed);
         let (file, disk) = node.run(|disk| async move {
@@ -764,11 +767,67 @@ fn an_operation_in_flight_when_its_process_dies_fails() {
         assert!(write.is_err(), "seed {seed}");
         assert!(rename.is_err(), "seed {seed}");
         node.ctrl.reboot(node.machine);
-        node.run(|disk| async move {
+        let after = node.run(|disk| async move {
             assert_eq!(disk.list("").await.unwrap(), ["a"]);
-            assert_eq!(contents(&disk, "a").await.unwrap(), b"before");
+            contents(&disk, "a").await.unwrap()
         });
+        assert!(
+            after == b"before" || after == b"after!",
+            "seed {seed}: {after:?}"
+        );
+        landed += u32::from(after == b"after!");
     }
+    assert!((1..10).contains(&landed), "{landed}");
+}
+
+/// Dropping a disk operation's future doesn't cancel it: it was submitted when called, as on a
+/// real disk, so what it changes lands anyway.
+#[test]
+fn a_dropped_operation_still_lands() {
+    let node = Node::new(0);
+    let ctx = node.ctx();
+    node.run(|disk| async move {
+        let file = disk.open("a", create()).await.unwrap();
+        // Dropped before polled, and dropped mid-flight.
+        drop(file.write_at(b"one".to_vec(), 0));
+        let _ = ctx
+            .timeout(Duration::ZERO, disk.rename("a", "b"))
+            .await
+            .unwrap_err();
+        drop(disk.open("c", create()));
+        assert_eq!(disk.list("").await.unwrap(), ["b", "c"]);
+        assert_eq!(contents(&disk, "b").await.unwrap(), b"one");
+    });
+}
+
+/// Operations issued together complete in an order the seed picks, not the order they were
+/// issued.
+#[test]
+fn operations_issued_together_may_complete_out_of_order() {
+    let mut reordered = 0;
+    for seed in 0..20 {
+        let node = Node::new(seed);
+        let ctx = node.ctx();
+        let order = node.run(|disk| async move {
+            let file = Rc::new(disk.open("a", create()).await.unwrap());
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let tasks: Vec<_> = (0..4u64)
+                .map(|i| {
+                    let (file, order) = (file.clone(), order.clone());
+                    ctx.spawn("writer", Priority::Default, async move {
+                        file.write_at(vec![1], i).await.0.unwrap();
+                        order.borrow_mut().push(i);
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await;
+            }
+            order.take()
+        });
+        reordered += u32::from(order != [0, 1, 2, 3]);
+    }
+    assert!(reordered > 0);
 }
 
 #[test]

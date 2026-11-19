@@ -12,6 +12,10 @@
 //! The model is deliberately weaker than a real filesystem (design doc, "Disk"): code that is
 //! correct here is correct on ext4 and XFS, not the other way around.
 //!
+//! Every operation is submitted when it's called, as the `DiskIo` contract requires: it takes its
+//! turn on one of the disk's queues then, and a change it makes lands even if its future is
+//! dropped. Queues run side by side, so operations issued together may complete in any order.
+//!
 //! Every random draw comes from the `disk` stream.
 
 mod inode;
@@ -19,14 +23,17 @@ mod tree;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, ready};
 
 use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture};
 use basalt_env::{DiskId, Duration, Instant, OpenOptions, ProcessId, Rng, Space};
 
 use crate::machine::Machines;
-use crate::time::Clock;
+use crate::time::{Clock, Sleep};
 
 use self::inode::{CorruptionMode, Inode};
 use self::tree::{Entry, InodeRef, State};
@@ -37,15 +44,21 @@ const CAPACITY: u64 = 16 << 30;
 /// How often an open picks full corruption over drop-only.
 const FULL_CORRUPTION_PROBABILITY: f64 = 0.5;
 
-/// The latency model: each operation occupies the disk for one I/O (an IOPS limit) plus its
-/// bytes at the disk's bandwidth, and a sync also waits for a cache flush. Operations queue
-/// behind each other, and each takes 50% to 150% of its nominal time, with a rare long stall.
+/// The latency model: each operation occupies one of the disk's queues for one I/O (an IOPS
+/// limit) plus its bytes at the disk's bandwidth, and a sync also waits for a cache flush. An
+/// operation goes to a queue drawn at random and waits behind what's already on it; each takes
+/// 50% to 150% of its nominal time, with a rare long stall.
+const QUEUES: usize = 4;
 const IO_TIME: Duration = Duration::from_micros(50);
 const BYTES_PER_SECOND: u64 = 1 << 30;
 const FLUSH_TIME: Duration = Duration::from_micros(500);
 const STALL_PROBABILITY: f64 = 0.001;
 const MIN_STALL: Duration = Duration::from_millis(5);
 const MAX_STALL: Duration = Duration::from_millis(50);
+
+/// How often the disk finishes an operation of a process that died while the operation was in
+/// flight, before the process died.
+const LANDED_PROBABILITY: f64 = 0.5;
 
 /// Every disk's contents and faults, by id. A disk's contents appear when it's first used and
 /// go when its machine is wiped or its disks fail.
@@ -108,7 +121,7 @@ impl Disks {
             let store = self.stores.borrow().get(&disk).cloned();
             if let Some(store) = store {
                 store.state.borrow_mut().power_cut(disk, &self.rng);
-                store.busy_until.set(Instant::ZERO);
+                store.queues.set([Instant::ZERO; QUEUES]);
             }
         }
     }
@@ -137,10 +150,10 @@ impl Disks {
         }
     }
 
-    /// Waits for an operation of `bytes` bytes on `store` to get its turn and finish. A crash
+    /// Queues an operation of `bytes` bytes on `store` and returns when it finishes. A crash
     /// doesn't cancel what's queued, since the OS finishes it, so the next incarnation's first
     /// operation may wait behind the last one's.
-    async fn io(&self, store: &Store, bytes: usize, flush: bool) {
+    fn schedule(&self, store: &Store, bytes: usize, flush: bool) -> Instant {
         let rng = &self.rng;
         let mut time =
             IO_TIME + Duration::from_nanos(bytes as u64 * 1_000_000_000 / BYTES_PER_SECOND);
@@ -151,10 +164,17 @@ impl Disks {
         if rng.bool(STALL_PROBABILITY) {
             time += rng.range(MIN_STALL..=MAX_STALL);
         }
-        let start = self.clock.now().max(store.busy_until.get());
-        let done = start.checked_add(time).unwrap_or(Instant::MAX);
-        store.busy_until.set(done);
-        self.clock.sleep_until(done).await;
+        let mut queues = store.queues.get();
+        let queue = &mut queues[rng.range(0..QUEUES)];
+        *queue = self
+            .clock
+            .now()
+            .max(*queue)
+            .checked_add(time)
+            .unwrap_or(Instant::MAX);
+        let done = *queue;
+        store.queues.set(queues);
+        done
     }
 
     /// Whether this operation hits an `EIO` fault on `store`.
@@ -181,8 +201,8 @@ struct Store {
     faults: RefCell<Faults>,
     /// The total length of every file on the disk, kept by the inodes themselves.
     usage: Rc<Cell<u64>>,
-    /// When the disk finishes the operations queued on it so far, in virtual time.
-    busy_until: Cell<Instant>,
+    /// When each of the disk's queues finishes the operations on it so far, in virtual time.
+    queues: Cell<[Instant; QUEUES]>,
 }
 
 #[derive(Default)]
@@ -201,7 +221,7 @@ impl Store {
             state: RefCell::default(),
             faults: RefCell::default(),
             usage: Rc::default(),
-            busy_until: Cell::new(Instant::ZERO),
+            queues: Cell::new([Instant::ZERO; QUEUES]),
         }
     }
 
@@ -237,17 +257,80 @@ struct Handle {
 }
 
 impl Handle {
-    /// Waits for an operation's turn on `store`, failing if the process is dead before or
-    /// after, since a kill may come while it waits.
+    /// Waits for a read's turn on `store` and its finish, failing if the process is dead before
+    /// or after, since a kill may come while it waits. A read changes nothing, so it starts
+    /// only when polled.
     async fn start(&self, store: &Store, bytes: usize, flush: bool) -> io::Result<()> {
         self.alive()?;
-        self.disks.io(store, bytes, flush).await;
+        let done = self.disks.schedule(store, bytes, flush);
+        self.disks.clock.sleep_until(done).await;
         self.alive()
+    }
+
+    /// Submits an operation that changes `store`: it takes its turn now, and `apply` runs when
+    /// it finishes, whether or not anyone awaits it.
+    fn submit<'a, T: 'a>(
+        &self,
+        store: &Store,
+        bytes: usize,
+        flush: bool,
+        apply: impl FnOnce() -> T + 'a,
+    ) -> InFlight<'a, T> {
+        let done = self.disks.schedule(store, bytes, flush);
+        InFlight {
+            sleep: self.disks.clock.sleep_until(done),
+            apply: Some(Box::new(apply)),
+        }
+    }
+
+    /// Runs `change`, the effect of a submitted operation that just finished, for the process.
+    /// A live process gets its result. A dead one gets an error, but the disk may have finished
+    /// the operation before the process died, so `change` may still happen.
+    fn complete<R>(&self, change: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        match self.alive() {
+            Ok(()) => change(),
+            Err(dead) => {
+                if self.disks.rng.bool(LANDED_PROBABILITY) {
+                    let _ = change();
+                }
+                Err(dead)
+            }
+        }
     }
 
     fn alive(&self) -> io::Result<()> {
         self.disks.machines.check_alive(self.process)
     }
+}
+
+/// An operation that changes a disk, submitted when it was called. Awaiting it waits until the
+/// disk finishes it and returns what it did. Dropping it first doesn't cancel it: the disk
+/// finishes it regardless, so it's applied then, at once, and its result is dropped.
+struct InFlight<'a, T> {
+    sleep: Sleep,
+    apply: Option<Box<dyn FnOnce() -> T + 'a>>,
+}
+
+impl<T> Future for InFlight<'_, T> {
+    type Output = T;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        ready!(Pin::new(&mut self.sleep).poll(cx));
+        let apply = self.apply.take().expect("polled after it finished");
+        Poll::Ready(apply())
+    }
+}
+
+impl<T> Drop for InFlight<'_, T> {
+    fn drop(&mut self) {
+        if let Some(apply) = self.apply.take() {
+            drop(apply());
+        }
+    }
+}
+
+/// The future for an operation that failed before it was submitted.
+fn failed<'a, T: 'a>(output: T) -> LocalBoxFuture<'a, T> {
+    Box::pin(std::future::ready(output))
 }
 
 /// A process's handle on one of its machine's disks.
@@ -257,12 +340,27 @@ pub(crate) struct SimDisk {
 }
 
 impl SimDisk {
-    /// Waits for an operation's turn on the disk and returns the disk.
-    async fn start(&self, flush: bool) -> io::Result<Rc<Store>> {
+    /// The disk's contents, once the process is checked to be alive.
+    fn store(&self) -> io::Result<Rc<Store>> {
         self.handle.alive()?;
-        let store = self.handle.disks.store(self.id);
-        self.handle.start(&store, 0, flush).await?;
-        Ok(store)
+        Ok(self.handle.disks.store(self.id))
+    }
+
+    /// Submits an operation that changes the disk. `change` runs on its contents when the
+    /// operation finishes.
+    fn submit<'a, T: 'a>(
+        &'a self,
+        flush: bool,
+        change: impl FnOnce(Rc<Store>) -> io::Result<T> + 'a,
+    ) -> LocalBoxFuture<'a, io::Result<T>> {
+        let store = match self.store() {
+            Ok(store) => store,
+            Err(e) => return failed(Err(e)),
+        };
+        let handle = &self.handle;
+        let disk = store.clone();
+        let apply = move || handle.complete(|| change(disk));
+        Box::pin(handle.submit(&store, 0, flush, apply))
     }
 }
 
@@ -325,10 +423,10 @@ impl DiskIo for SimDisk {
         path: &'a str,
         opts: OpenOptions,
     ) -> LocalBoxFuture<'a, io::Result<Box<dyn FileIo>>> {
-        Box::pin(async move {
-            check_path(path)?;
-            check_options(opts)?;
-            let store = self.start(false).await?;
+        if let Err(e) = check_path(path).and_then(|()| check_options(opts)) {
+            return failed(Err(e));
+        }
+        self.submit(false, move |store| {
             let existing = {
                 let state = store.state.borrow();
                 state.live().check_parents(path)?;
@@ -383,10 +481,10 @@ impl DiskIo for SimDisk {
     }
 
     fn rename<'a>(&'a self, from: &'a str, to: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            check_path(from)?;
-            check_path(to)?;
-            let store = self.start(false).await?;
+        if let Err(e) = check_path(from).and_then(|()| check_path(to)) {
+            return failed(Err(e));
+        }
+        self.submit(false, move |store| {
             let mut state = store.state.borrow_mut();
             let live = state.live();
             live.check_parents(from)?;
@@ -408,9 +506,10 @@ impl DiskIo for SimDisk {
     }
 
     fn remove<'a>(&'a self, path: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            check_path(path)?;
-            let store = self.start(false).await?;
+        if let Err(e) = check_path(path) {
+            return failed(Err(e));
+        }
+        self.submit(false, move |store| {
             let mut state = store.state.borrow_mut();
             state.live().check_parents(path)?;
             match state.live().entry(path) {
@@ -427,7 +526,8 @@ impl DiskIo for SimDisk {
     fn list<'a>(&'a self, dir: &'a str) -> LocalBoxFuture<'a, io::Result<Vec<String>>> {
         Box::pin(async move {
             check_dir(dir)?;
-            let store = self.start(false).await?;
+            let store = self.store()?;
+            self.handle.start(&store, 0, false).await?;
             let state = store.state.borrow();
             let live = state.live();
             live.check_parents(dir)?;
@@ -443,9 +543,10 @@ impl DiskIo for SimDisk {
     }
 
     fn sync_dir<'a>(&'a self, dir: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            check_dir(dir)?;
-            let store = self.start(true).await?;
+        if let Err(e) = check_dir(dir) {
+            return failed(Err(e));
+        }
+        self.submit(true, move |store| {
             let mut state = store.state.borrow_mut();
             state.live().check_parents(dir)?;
             match state.live().entry(dir) {
@@ -487,6 +588,15 @@ struct SimFile {
 }
 
 impl SimFile {
+    /// Fails with `not_writable()` unless the handle was opened for writing, and fails if its
+    /// process is dead, before an operation that writes is submitted.
+    fn writable(&self, not_writable: fn() -> io::Error) -> io::Result<()> {
+        if !self.opts.write {
+            return Err(not_writable());
+        }
+        self.handle.alive()
+    }
+
     /// Fails with `StorageFull` unless the file can grow to `len`.
     fn reserve(&self, len: u64) -> io::Result<()> {
         let old = self.inode.borrow().len();
@@ -527,13 +637,15 @@ impl FileIo for SimFile {
     }
 
     fn write_at(&self, buf: Vec<u8>, offset: u64) -> LocalBoxFuture<'_, (io::Result<()>, Vec<u8>)> {
-        Box::pin(async move {
-            let result = async {
-                if !self.opts.write {
-                    return Err(bad_handle());
-                }
-                self.handle.start(&self.store, buf.len(), false).await?;
-                self.handle.disks.io_error(&self.store)?;
+        if let Err(e) = self.writable(bad_handle) {
+            return failed((Err(e), buf));
+        }
+        let handle = &self.handle;
+        let store = &self.store;
+        let len = buf.len();
+        Box::pin(handle.submit(store, len, false, move || {
+            let result = handle.complete(|| {
+                handle.disks.io_error(store)?;
                 if buf.is_empty() {
                     return Ok(());
                 }
@@ -543,30 +655,36 @@ impl FileIo for SimFile {
                 self.reserve(end)?;
                 self.inode.borrow_mut().write(&buf, offset, self.mode);
                 Ok(())
-            }
-            .await;
+            });
             (result, buf)
-        })
+        }))
     }
 
     fn sync(&self) -> LocalBoxFuture<'_, io::Result<()>> {
-        Box::pin(async move {
-            self.handle.start(&self.store, 0, true).await?;
-            self.inode.borrow_mut().sync();
-            Ok(())
-        })
+        if let Err(e) = self.handle.alive() {
+            return failed(Err(e));
+        }
+        let handle = &self.handle;
+        Box::pin(handle.submit(&self.store, 0, true, move || {
+            handle.complete(|| {
+                self.inode.borrow_mut().sync();
+                Ok(())
+            })
+        }))
     }
 
     fn set_len(&self, len: u64) -> LocalBoxFuture<'_, io::Result<()>> {
-        Box::pin(async move {
-            if !self.opts.write {
-                return Err(io::Error::from_raw_os_error(22));
-            }
-            self.handle.start(&self.store, 0, false).await?;
-            self.reserve(len)?;
-            self.inode.borrow_mut().set_len(len, self.mode);
-            Ok(())
-        })
+        if let Err(e) = self.writable(|| io::Error::from_raw_os_error(22)) {
+            return failed(Err(e));
+        }
+        let handle = &self.handle;
+        Box::pin(handle.submit(&self.store, 0, false, move || {
+            handle.complete(|| {
+                self.reserve(len)?;
+                self.inode.borrow_mut().set_len(len, self.mode);
+                Ok(())
+            })
+        }))
     }
 
     fn len(&self) -> u64 {

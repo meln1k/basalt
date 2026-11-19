@@ -1,4 +1,5 @@
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::rc::Rc;
 
@@ -72,6 +73,15 @@ impl OpenOptions {
 
 /// A disk of this process's machine, from [`Ctx::disk`](crate::Ctx::disk).
 ///
+/// # Operations are submitted when called
+///
+/// Every operation on a disk or file starts when it's called, not when its future is first
+/// polled, and a change it makes (creating, writing, renaming, syncing) completes whether or
+/// not its future is kept. Dropping the future only drops the result. So a cancelled write may
+/// or may not have landed, and operations issued together may complete in any order; only
+/// awaiting one before calling the next orders them. If the process dies with an operation in
+/// flight, the disk may or may not have finished it.
+///
 /// Nothing is durable until it's synced: file contents by [`File::sync`], and creating,
 /// renaming, and removing files by [`Disk::sync_dir`] on the directory that holds them. In
 /// simulation, a power cut loses or corrupts anything not yet synced.
@@ -110,28 +120,36 @@ impl Disk {
         self.id
     }
 
-    pub async fn open(&self, path: &str, opts: OpenOptions) -> io::Result<File> {
-        let io = self.io.open(path, opts).await?;
-        Ok(File { io })
+    pub fn open<'a>(
+        &'a self,
+        path: &'a str,
+        opts: OpenOptions,
+    ) -> impl Future<Output = io::Result<File>> + 'a {
+        let opened = self.io.open(path, opts);
+        async move { Ok(File { io: opened.await? }) }
     }
 
-    pub async fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.io.rename(from, to).await
+    pub fn rename<'a>(
+        &'a self,
+        from: &'a str,
+        to: &'a str,
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        self.io.rename(from, to)
     }
 
-    pub async fn remove(&self, path: &str) -> io::Result<()> {
-        self.io.remove(path).await
+    pub fn remove<'a>(&'a self, path: &'a str) -> impl Future<Output = io::Result<()>> + 'a {
+        self.io.remove(path)
     }
 
     /// The names of the files directly in `dir`, sorted.
-    pub async fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        self.io.list(dir).await
+    pub fn list<'a>(&'a self, dir: &'a str) -> impl Future<Output = io::Result<Vec<String>>> + 'a {
+        self.io.list(dir)
     }
 
     /// Makes durable the creating, renaming, and removing of files directly in `dir`, and every
     /// directory on the path to it.
-    pub async fn sync_dir(&self, dir: &str) -> io::Result<()> {
-        self.io.sync_dir(dir).await
+    pub fn sync_dir<'a>(&'a self, dir: &'a str) -> impl Future<Output = io::Result<()>> + 'a {
+        self.io.sync_dir(dir)
     }
 
     pub fn space(&self) -> Space {
@@ -157,22 +175,30 @@ pub struct File {
 impl File {
     /// Reads into `buf[..buf.len()]` from `offset` and returns the number of bytes read, which is
     /// less than `buf.len()` only at the end of the file. Size the buffer with `vec![0; n]`.
-    pub async fn read_at(&self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
-        self.io.read_at(buf, offset).await
+    pub fn read_at(
+        &self,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> + '_ {
+        self.io.read_at(buf, offset)
     }
 
     /// Writes all of `buf` at `offset`, extending the file if needed.
-    pub async fn write_at(&self, buf: Vec<u8>, offset: u64) -> (io::Result<()>, Vec<u8>) {
-        self.io.write_at(buf, offset).await
+    pub fn write_at(
+        &self,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> impl Future<Output = (io::Result<()>, Vec<u8>)> + '_ {
+        self.io.write_at(buf, offset)
     }
 
     /// Makes everything written to the file so far durable.
-    pub async fn sync(&self) -> io::Result<()> {
-        self.io.sync().await
+    pub fn sync(&self) -> impl Future<Output = io::Result<()>> + '_ {
+        self.io.sync()
     }
 
-    pub async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.io.set_len(len).await
+    pub fn set_len(&self, len: u64) -> impl Future<Output = io::Result<()>> + '_ {
+        self.io.set_len(len)
     }
 
     /// The file's length, including writes not yet synced.

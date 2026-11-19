@@ -72,6 +72,7 @@ impl Ctx {
 
 - **`Task<T>`** wraps `async_task::Task`. Dropping it cancels the future. `detach()` hands the task to its process's task set instead of leaking it, so killing a process still drops it.
 - **`Stream`** implements `futures-io` `AsyncRead`/`AsyncWrite` and nothing else. Protocols such as HTTP are layered on top of it in their own crates, so `basalt-env` stays free of protocol dependencies.
+- **Disk operations are submitted when called**, not when first polled, and complete even if their future is dropped, as io_uring and a thread pool both behave.
 - **Disk I/O takes owned buffers** (`write_at(buf: Vec<u8>, offset) -> (io::Result<()>, Vec<u8>)`), so moving to io_uring later doesn't change the API.
 - **`compute`** runs inline in simulation, with the ambient world suspended so the job sees what a production pool thread sees, and charges `cost` in virtual time. In production it runs on a thread pool, the only place where `Send` is required.
 
@@ -165,6 +166,7 @@ Separating `Crash` from `PowerCut` goes further than FoundationDB. A missing fsy
 - Each file has a durable image and a list of pending writes since its last `sync`. Creating, renaming, and removing files is also pending until `sync_dir`.
 - Each file picks a corruption mode at open: drop only, or full corruption with torn sectors. A power cut applies that mode to each pending page.
 - Other faults: a full disk (`ENOSPC`), read and write errors (`EIO`), rare bit flips on read, and latency from an IOPS and bandwidth model.
+- Every operation is submitted when it's called, in both backends: a change it makes lands even if its future is dropped, and operations in flight together complete in any order. The simulator spreads each disk's operations over 4 queues. If a process dies with an operation in flight, the operation may or may not land.
 - The model is deliberately weaker than real filesystems. Code that is correct on it is correct on ext4 and XFS, not the other way around.
 
 ### Clocks

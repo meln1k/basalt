@@ -284,7 +284,7 @@ fn planted_bug_demo(test: &str, seed: u64, violation: &[&str]) {
 fn skip_writeback_is_caught_by_the_linearizability_checker() {
     planted_bug_demo(
         "register-skip-writeback",
-        1,
+        76,
         &[
             "linearizability violation on key",
             "no operation can follow these",
@@ -297,7 +297,7 @@ fn skip_writeback_is_caught_by_the_linearizability_checker() {
 fn ack_before_sync_is_caught_by_the_durability_checker() {
     planted_bug_demo(
         "register-ack-before-sync",
-        40,
+        117,
         &["durability violation on key", "losing acknowledged writes"],
     );
 }

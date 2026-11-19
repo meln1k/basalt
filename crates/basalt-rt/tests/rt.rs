@@ -234,6 +234,37 @@ fn a_file_write_sync_and_read_round_trip_and_survive_a_restart() {
     });
 }
 
+/// A disk operation is submitted when called, so dropping its future before polling it
+/// doesn't stop it: the I/O pool runs it anyway.
+#[test]
+fn a_dropped_disk_operation_still_runs() {
+    let dir = TempDir::new("dropped");
+    let rt = Runtime::new(Config {
+        disks: vec![dir.0.clone()],
+        ..Config::default()
+    })
+    .unwrap();
+    let ctx = rt.ctx();
+    run(&rt, async {
+        let disk = ctx.disk(DiskId::new(0));
+        let create = OpenOptions::new().read(true).write(true).create(true);
+        let file = disk.open("a", create).await.unwrap();
+        drop(file.write_at(b"one".to_vec(), 0));
+        drop(disk.open("b", create));
+        // The pool runs them in its own time; wait until both have landed.
+        let landed = async {
+            loop {
+                let (n, buf) = file.read_at(vec![0; 3], 0).await;
+                if n.unwrap() == 3 && buf == b"one" && disk.list("").await.unwrap() == ["a", "b"] {
+                    return;
+                }
+                ctx.sleep(Duration::from_millis(1)).await;
+            }
+        };
+        ctx.timeout(Duration::from_secs(5), landed).await.unwrap();
+    });
+}
+
 fn kind<T>(result: io::Result<T>) -> io::ErrorKind {
     result.map(drop).unwrap_err().kind()
 }

@@ -197,6 +197,12 @@ pub trait ListenerIo {
 
 /// A disk. Nothing written to it is durable until it is synced: file contents by
 /// [`FileIo::sync`], and creating, renaming, and removing files by [`DiskIo::sync_dir`].
+///
+/// Every method of `DiskIo` and [`FileIo`] submits its operation when called, before the
+/// returned future is polled. An operation that changes the disk completes even if its future
+/// is dropped, and operations in flight together may complete in any order (see
+/// [`Disk`](crate::Disk)). An operation of a process that dies while it's in flight may or may
+/// not complete.
 pub trait DiskIo {
     fn open<'a>(
         &'a self,

@@ -164,13 +164,15 @@ impl SimWorld {
         let disks = self.machines.kill(machine, kind);
         trace!(Info, "MachineKilled", machine = machine.get(), kind = kind);
         self.net.processes_died();
+        // Before the disks change: dropping a task applies its disk operations in flight, if
+        // the disk got to them, and a power cut or wipe must find them there.
+        self.reap();
         match kind {
             // The page cache outlives the processes.
             KillType::Crash => {}
             KillType::PowerCut => self.disks.power_cut(&disks),
             KillType::DiskFail | KillType::Wipe => self.disks.remove(&disks),
         }
-        self.reap();
     }
 
     /// Brings `machine` back up, after a `Crash` kill if it's up, and starts a new incarnation

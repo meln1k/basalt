@@ -1,4 +1,5 @@
-//! Disks as directories on the host, with blocking file calls on the I/O pool.
+//! Disks as directories on the host, with blocking file calls on the I/O pool. Each call is
+//! submitted to the pool when it's made, so it completes even if its future is dropped.
 //!
 //! The path and directory rules are in `basalt_env::Disk`'s docs, which both backends follow.
 
@@ -27,16 +28,17 @@ impl Disk {
         }
     }
 
-    /// Runs `f` on the I/O pool with an already resolved path.
+    /// Submits `f` to the I/O pool now, with an already resolved path, as the `DiskIo`
+    /// contract requires: it runs even if the returned future is dropped.
     fn run<T: Send + 'static>(
         &self,
         path: io::Result<PathBuf>,
         f: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
-    ) -> LocalBoxFuture<'_, io::Result<T>> {
-        Box::pin(async move {
-            let path = path?;
-            self.pool.run(move || f(path)).await
-        })
+    ) -> LocalBoxFuture<'static, io::Result<T>> {
+        match path {
+            Ok(path) => Box::pin(self.pool.run(move || f(path))),
+            Err(e) => Box::pin(std::future::ready(Err(e))),
+        }
     }
 
     /// A file's path: non-empty components without `.` or `..`.
