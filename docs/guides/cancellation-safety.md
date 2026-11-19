@@ -5,7 +5,7 @@ Any `.await` in Basalt's code may be the last line of its function that ever run
 - Someone drops the `Task` handle, or the future itself, such as the losing side of a race.
 - `ctx.timeout` expires and drops the future it wraps.
 - The process is killed. Every one of its futures is dropped before any other task runs, including detached tasks and tasks whose handle another process holds.
-- In simulation, a `buggify!` site in the executor now and then drops a random detached task (see `cancel_random_task` in `basalt-sim/src/world.rs`).
+- In simulation, a `buggify!` site in the run loop now and then drops a random detached task (see `cancel_random_task` in `basalt-sim/src/world.rs`).
 
 When a future is dropped, the code after its pending `.await` never runs, but the `Drop` of every value it holds does. Write each async function so that stopping at any `.await` leaves the process in a state it can carry on from, and leaves the disk in a state a reboot can recover from.
 
@@ -25,4 +25,4 @@ When a future is dropped, the code after its pending `.await` never runs, but th
 
 ## How simulation checks this
 
-Kills and the random-cancel site both drop futures at `.await` points the code chose, at times the seed chose. A bug of this kind shows up as a failed check or an `Error` trace right after a `MachineKilled` or `TaskCancelled` event in the trace of the failing seed. Rerun it with `basalt sim run --test <test> --seed <seed>` to see which task was dropped and where it was waiting.
+Kills and the random-cancel site both drop futures at `.await` points the code chose, at times the seed chose. A bug of this kind shows up as a failed check or an `Error` trace right after a `MachineKilled` or `TaskCancelled` event in the trace of the failing seed. Rerun it with `basalt sim run --test <test> --seed <seed>` to see which task was dropped (`TaskCancelled` names it) and what it traced before.

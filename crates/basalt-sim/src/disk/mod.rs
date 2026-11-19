@@ -331,8 +331,8 @@ impl DiskIo for SimDisk {
             let store = self.start(false).await?;
             let existing = {
                 let state = store.state.borrow();
-                state.live.check_parents(path)?;
-                match state.live.entry(path) {
+                state.live().check_parents(path)?;
+                match state.live().entry(path) {
                     Entry::Dir | Entry::File(_) if opts.create_new => {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
@@ -388,7 +388,7 @@ impl DiskIo for SimDisk {
             check_path(to)?;
             let store = self.start(false).await?;
             let mut state = store.state.borrow_mut();
-            let live = &state.live;
+            let live = state.live();
             live.check_parents(from)?;
             let inode = match live.entry(from) {
                 Entry::Missing => return Err(not_found(from)),
@@ -412,8 +412,8 @@ impl DiskIo for SimDisk {
             check_path(path)?;
             let store = self.start(false).await?;
             let mut state = store.state.borrow_mut();
-            state.live.check_parents(path)?;
-            match state.live.entry(path) {
+            state.live().check_parents(path)?;
+            match state.live().entry(path) {
                 Entry::Missing => Err(not_found(path)),
                 Entry::Dir => Err(is_a_directory(path)),
                 Entry::File(_) => {
@@ -429,7 +429,7 @@ impl DiskIo for SimDisk {
             check_dir(dir)?;
             let store = self.start(false).await?;
             let state = store.state.borrow();
-            let live = &state.live;
+            let live = state.live();
             live.check_parents(dir)?;
             if let Entry::File(_) = live.entry(dir) {
                 return Err(not_a_directory(dir));
@@ -447,8 +447,8 @@ impl DiskIo for SimDisk {
             check_dir(dir)?;
             let store = self.start(true).await?;
             let mut state = store.state.borrow_mut();
-            state.live.check_parents(dir)?;
-            match state.live.entry(dir) {
+            state.live().check_parents(dir)?;
+            match state.live().entry(dir) {
                 Entry::File(_) => Err(not_a_directory(dir)),
                 // Nothing in a missing directory can be lost.
                 Entry::Missing => Ok(()),

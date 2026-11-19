@@ -19,9 +19,7 @@ pub(super) type InodeRef = Rc<RefCell<Inode>>;
 /// What processes see, and what survives a power cut.
 #[derive(Default)]
 pub(super) struct State {
-    /// Change its files only through [`State::insert_file`] and [`State::remove_file`], which
-    /// keep `pending`.
-    pub(super) live: Tree,
+    live: Tree,
     durable: Tree,
     /// The file paths whose live entry may differ from their durable one. Every other path has
     /// the same entry, or none, in both trees.
@@ -33,7 +31,7 @@ pub(super) struct State {
 #[derive(Clone, Default)]
 pub(super) struct Tree {
     dirs: BTreeSet<String>,
-    pub(super) files: BTreeMap<String, InodeRef>,
+    files: BTreeMap<String, InodeRef>,
 }
 
 pub(super) enum Entry {
@@ -65,7 +63,7 @@ impl Tree {
 
     /// Creates the missing directories above `path`, once
     /// [`check_parents`](Tree::check_parents) passed.
-    pub(super) fn create_parents(&mut self, path: &str) {
+    fn create_parents(&mut self, path: &str) {
         for parent in parents(path) {
             if !self.dirs.contains(parent) {
                 self.dirs.insert(parent.to_owned());
@@ -122,6 +120,12 @@ fn prefix(dir: &str) -> String {
 }
 
 impl State {
+    /// What processes see. Its names change only through [`State::insert_file`] and
+    /// [`State::remove_file`], which keep `pending`.
+    pub(super) fn live(&self) -> &Tree {
+        &self.live
+    }
+
     /// Gives the live file at `path` the contents `inode`, creating the directories above it.
     pub(super) fn insert_file(&mut self, path: &str, inode: InodeRef) {
         self.live.create_parents(path);
@@ -150,8 +154,8 @@ impl State {
                 durable.dirs.insert(d.to_owned());
             }
         }
-        // Only the pending names in `dir` can differ, so a directory with many files costs only
-        // what changed in it since its last sync.
+        // Only pending names can differ, so this costs only what changed under `dir` since it
+        // was last synced, however many files it has.
         let prefix = prefix(dir);
         let synced: Vec<String> = pending
             .range(prefix.clone()..)
