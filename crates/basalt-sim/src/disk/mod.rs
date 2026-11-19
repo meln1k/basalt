@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
-use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture};
+use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture, check_dir, check_path};
 use basalt_env::{DiskId, Duration, Instant, OpenOptions, ProcessId, Rng, Space};
 
 use crate::machine::Machines;
@@ -361,32 +361,6 @@ impl SimDisk {
         let disk = store.clone();
         let apply = move || handle.complete(|| change(disk));
         Box::pin(handle.submit(&store, 0, flush, apply))
-    }
-}
-
-/// Checks a file path: non-empty components joined by `/`, without `.` or `..`.
-fn check_path(path: &str) -> io::Result<()> {
-    let valid = !path.is_empty()
-        && !path.contains('\0')
-        && path
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..");
-    if valid {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid disk path {path:?}: use relative `a/b` paths without `.` or `..`"),
-        ))
-    }
-}
-
-/// Checks a directory path: like a file's, or `""` for the root.
-fn check_dir(dir: &str) -> io::Result<()> {
-    if dir.is_empty() {
-        Ok(())
-    } else {
-        check_path(dir)
     }
 }
 

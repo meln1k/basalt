@@ -216,6 +216,33 @@ pub trait DiskIo {
     fn space(&self) -> Space;
 }
 
+/// Checks a file path against [`Disk`](crate::Disk)'s rules: non-empty components joined by
+/// `/`, without `.` or `..`. Every backend checks paths with this before touching the disk.
+pub fn check_path(path: &str) -> io::Result<()> {
+    let valid = !path.is_empty()
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid disk path {path:?}: use relative `a/b` paths without `.` or `..`"),
+        ))
+    }
+}
+
+/// Checks a directory path: like a file's, or `""` for the root.
+pub fn check_dir(dir: &str) -> io::Result<()> {
+    if dir.is_empty() {
+        Ok(())
+    } else {
+        check_path(dir)
+    }
+}
+
 /// An open file. I/O takes and returns owned buffers, so an io_uring backend can hold them while
 /// the kernel works.
 #[allow(clippy::len_without_is_empty)]
