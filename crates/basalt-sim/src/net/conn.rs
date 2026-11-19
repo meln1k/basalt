@@ -199,14 +199,12 @@ impl Conn {
             let ConnState {
                 readers, writers, ..
             } = &mut *st;
-            let wakers: Vec<Waker> = readers
-                .iter_mut()
-                .chain(writers)
-                .filter_map(Option::take)
-                .collect();
+            let [r0, r1] = readers;
+            let [w0, w1] = writers;
+            let wakers = [r0.take(), r1.take(), w0.take(), w1.take()];
             (result, wakers)
         };
-        wakers.into_iter().for_each(Waker::wake);
+        wakers.into_iter().flatten().for_each(Waker::wake);
         result
     }
 
@@ -357,7 +355,11 @@ fn park(
     slot: impl FnOnce(&mut ConnState) -> &mut Option<Waker>,
     cx: &Context<'_>,
 ) {
-    let old = slot(&mut st).replace(cx.waker().clone());
+    let slot = slot(&mut st);
+    if slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+        return;
+    }
+    let old = slot.replace(cx.waker().clone());
     drop(st);
     drop(old);
 }

@@ -40,6 +40,7 @@ impl fmt::Display for TraceRecord {
 }
 
 pub(crate) struct TraceLog {
+    /// Every record so far, kept only while no sink is set.
     records: RefCell<Vec<TraceRecord>>,
     /// Every record so far. `DefaultHasher::new()` has fixed keys, unlike `RandomState`. Its
     /// algorithm may change between Rust releases, which is fine: unseeds are only compared
@@ -86,11 +87,13 @@ impl TraceLog {
         // Taken out while it runs, so a sink that traces doesn't hit a borrowed `RefCell`; what
         // it traces isn't passed back to it.
         let sink = self.sink.borrow_mut().take();
-        if let Some(mut sink) = sink {
-            sink(&record);
-            self.sink.borrow_mut().get_or_insert(sink);
+        match sink {
+            Some(mut sink) => {
+                sink(&record);
+                self.sink.borrow_mut().get_or_insert(sink);
+            }
+            None => self.records.borrow_mut().push(record),
         }
-        self.records.borrow_mut().push(record);
     }
 
     pub(crate) fn set_sink(&self, sink: Sink) {

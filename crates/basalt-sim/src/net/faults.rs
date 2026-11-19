@@ -91,10 +91,21 @@ impl Faults {
         self.partitions.retain(|_, spans| !spans.is_empty());
     }
 
+    /// Whether no clog or partition is left, as in most of a run.
+    fn is_clear(&self) -> bool {
+        self.pair_clogs.is_empty()
+            && self.send_clogs.is_empty()
+            && self.receive_clogs.is_empty()
+            && self.partitions.is_empty()
+    }
+
     /// When something sent from `from` to `to`, due at `due` without faults, arrives: at the
     /// first time from `due` on that no clog or partition covers, or `Instant::MAX` behind a
     /// partition that never ends. Later dues never arrive earlier.
     pub(super) fn arrival(&self, from: MachineId, to: MachineId, due: Instant) -> Instant {
+        if self.is_clear() {
+            return due;
+        }
         let spans = [
             self.pair_clogs.get(&(from, to)),
             self.send_clogs.get(&from),

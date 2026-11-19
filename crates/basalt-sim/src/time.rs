@@ -102,11 +102,24 @@ impl Future for Sleep {
             clock.next_timer.set(id + 1);
             (*deadline, id)
         });
-        let old = clock.timers.borrow_mut().insert(key, cx.waker().clone());
-        // Outside the borrow, since a waker may be anything.
-        drop(old);
+        register(&clock.timers, key, cx);
         Poll::Pending
     }
+}
+
+/// Sets the waker under `key` to wake the current task, leaving it alone when it already does,
+/// as it usually does when the same task polls again.
+fn register<K: Ord>(wakers: &RefCell<BTreeMap<K, Waker>>, key: K, cx: &Context<'_>) {
+    let old = {
+        let mut wakers = wakers.borrow_mut();
+        match wakers.get_mut(&key) {
+            Some(waker) if waker.will_wake(cx.waker()) => return,
+            Some(waker) => Some(std::mem::replace(waker, cx.waker().clone())),
+            None => wakers.insert(key, cx.waker().clone()),
+        }
+    };
+    // Outside the borrow, since a waker may be anything.
+    drop(old);
 }
 
 impl Drop for Sleep {
@@ -315,8 +328,7 @@ impl Future for LocalSleep {
             machine.next_sleeper.set(id + 1);
             id
         });
-        let old = machine.sleepers.borrow_mut().insert(id, cx.waker().clone());
-        drop(old);
+        register(&machine.sleepers, id, cx);
         Poll::Pending
     }
 }

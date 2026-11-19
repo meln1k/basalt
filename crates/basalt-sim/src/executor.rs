@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-use std::thread::{self, ThreadId};
+use std::thread;
 
 use basalt_env::backend::{DetachedTask, Runnable, Scheduler, TaskMeta};
 use basalt_env::{Priority, Rng, TaskId};
@@ -12,10 +12,11 @@ use basalt_env::{Priority, Rng, TaskId};
 /// Runs tasks in priority order and keeps what it needs to drop them, following the task and
 /// kill rules in `basalt_env::backend`.
 pub(crate) struct Executor {
-    thread: ThreadId,
     /// Whether ready tasks of equal priority run in a seeded random order rather than FIFO.
     shuffle: bool,
     ready: Arc<Mutex<Ready>>,
+    /// Queues each runnable woken, shared by every task.
+    scheduler: Scheduler,
     next_task: Cell<u64>,
     /// Every task from `start_task` until `task_ended`.
     tasks: RefCell<BTreeMap<TaskId, LiveTask>>,
@@ -31,10 +32,11 @@ struct LiveTask {
 
 impl Executor {
     pub(crate) fn new(shuffle: bool) -> Executor {
+        let ready = Arc::<Mutex<Ready>>::default();
         Executor {
-            thread: thread::current().id(),
             shuffle,
-            ready: Arc::default(),
+            scheduler: scheduler(ready.clone()),
+            ready,
             next_task: Cell::new(0),
             tasks: RefCell::default(),
         }
@@ -58,19 +60,7 @@ impl Executor {
     }
 
     pub(crate) fn scheduler(&self) -> Scheduler {
-        let (ready, thread) = (self.ready.clone(), self.thread);
-        Arc::new(move |runnable| {
-            if thread::current().id() != thread {
-                // Dropping the runnable here would drop the task's future on this thread too,
-                // which `async-task` turns into a second panic. Leak it instead.
-                std::mem::forget(runnable);
-                panic!(
-                    "a simulated task was woken from another thread, which makes the simulation \
-                     nondeterministic"
-                );
-            }
-            ready.lock().unwrap().push(runnable);
-        })
+        self.scheduler.clone()
     }
 
     pub(crate) fn ended(&self, task: TaskId) {
@@ -147,6 +137,23 @@ impl Executor {
             runnables.into_iter().for_each(&drop_one);
         }
     }
+}
+
+/// The scheduler of every task: queues the woken runnable, on the thread that created it.
+fn scheduler(ready: Arc<Mutex<Ready>>) -> Scheduler {
+    let thread = thread::current().id();
+    Arc::new(move |runnable| {
+        if thread::current().id() != thread {
+            // Dropping the runnable here would drop the task's future on this thread too,
+            // which `async-task` turns into a second panic. Leak it instead.
+            std::mem::forget(runnable);
+            panic!(
+                "a simulated task was woken from another thread, which makes the simulation \
+                 nondeterministic"
+            );
+        }
+        ready.lock().unwrap().push(runnable);
+    })
 }
 
 /// Ready runnables, one FIFO queue per priority. It's behind a mutex only because `async-task`

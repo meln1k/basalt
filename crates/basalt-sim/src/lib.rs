@@ -131,13 +131,16 @@ impl Sim {
         self.world.clock.now()
     }
 
-    /// Every trace event recorded so far, in order.
+    /// Every trace event recorded so far, in order, up to when a sink was set with
+    /// [`on_trace`](Sim::on_trace).
     pub fn trace(&self) -> Ref<'_, [TraceRecord]> {
         self.world.trace.records()
     }
 
     /// Calls `sink` with each trace event as it's recorded, for example to print a run's trace
-    /// as it happens, so a panic doesn't lose it. Replaces any earlier sink.
+    /// as it happens, so a panic doesn't lose it. Replaces any earlier sink. From then on the
+    /// sink gets each record instead of [`trace`](Sim::trace), so a long run's trace doesn't
+    /// stay in memory.
     pub fn on_trace(&self, sink: impl FnMut(&TraceRecord) + 'static) {
         self.world.trace.set_sink(Box::new(sink));
     }

@@ -32,11 +32,20 @@ pub struct Coverage {
 /// BUGGIFY's state for one run.
 #[derive(Default)]
 pub(crate) struct Buggify {
-    /// Each site's switch, drawn the first time the site is reached.
-    switches: RefCell<BTreeMap<Location, bool>>,
+    /// Each site reached: its switch, drawn the first time it's reached, and its hits.
+    sites: RefCell<BTreeMap<SiteKey, (bool, SiteHits)>>,
     /// Set by [`lift`](Buggify::lift): from then on no `buggify!` fires.
     lifted: Cell<bool>,
-    coverage: RefCell<Coverage>,
+    /// Hits per probe.
+    probes: RefCell<BTreeMap<Location, u64>>,
+}
+
+/// A [`Location`] ordered by line and column first, which tells most sites apart without
+/// comparing file names, as every lookup on a hot path would.
+type SiteKey = (u32, u32, &'static str);
+
+fn site_key(location: Location) -> SiteKey {
+    (location.line, location.column, location.file)
 }
 
 impl Buggify {
@@ -48,15 +57,11 @@ impl Buggify {
         if self.lifted.get() {
             return false;
         }
-        let key = site.location;
-        let on = *self
-            .switches
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| rng.bool(BUGGIFY_SWITCH_PROBABILITY));
-        let fired = on && rng.bool(fire);
-        let mut coverage = self.coverage.borrow_mut();
-        let hits = coverage.buggify.entry(key).or_default();
+        let mut sites = self.sites.borrow_mut();
+        let (on, hits) = sites
+            .entry(site_key(site.location))
+            .or_insert_with(|| (rng.bool(BUGGIFY_SWITCH_PROBABILITY), SiteHits::default()));
+        let fired = *on && rng.bool(fire);
         hits.reached += 1;
         hits.fired += u64::from(fired);
         fired
@@ -69,15 +74,17 @@ impl Buggify {
     }
 
     pub(crate) fn probe(&self, site: &ProbeSite) {
-        *self
-            .coverage
-            .borrow_mut()
-            .probes
-            .entry(site.location)
-            .or_default() += 1;
+        *self.probes.borrow_mut().entry(site.location).or_default() += 1;
     }
 
     pub(crate) fn coverage(&self) -> Coverage {
-        self.coverage.borrow().clone()
+        let sites = self.sites.borrow();
+        let buggify = sites
+            .iter()
+            .map(|(&(line, column, file), &(_, hits))| (Location { file, line, column }, hits));
+        Coverage {
+            buggify: buggify.collect(),
+            probes: self.probes.borrow().clone(),
+        }
     }
 }

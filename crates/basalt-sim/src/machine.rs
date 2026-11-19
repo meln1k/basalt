@@ -1,7 +1,6 @@
 //! Machines, the processes on them, and which incarnations are alive.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
 
@@ -62,10 +61,9 @@ pub(crate) struct Machines {
     clock: Rc<Clock>,
     /// Indexed by `MachineId`.
     machines: RefCell<Vec<Machine>>,
-    /// Dead incarnations stay, since a dead process's `Ctx` still reads its machine's clocks and
-    /// disks.
-    processes: RefCell<BTreeMap<ProcessId, Process>>,
-    next_process: Cell<u32>,
+    /// Every incarnation, indexed by `ProcessId`. Dead incarnations stay, since a dead process's
+    /// `Ctx` still reads its machine's clocks and disks.
+    processes: RefCell<Vec<Process>>,
     next_disk: Cell<u32>,
 }
 
@@ -97,7 +95,6 @@ impl Machines {
             clock,
             machines: RefCell::default(),
             processes: RefCell::default(),
-            next_process: Cell::new(0),
             next_disk: Cell::new(0),
         }
     }
@@ -247,20 +244,19 @@ impl Machines {
         f(self
             .processes
             .borrow()
-            .get(&process)
+            .get(process.get() as usize)
             .expect("every process id comes from this world"))
     }
 
     /// A fresh id for a new incarnation; ids are never reused.
     fn incarnate(&self, label: Rc<str>, machine: MachineId, boot: u32) -> ProcessId {
-        let id = ProcessId::new(self.next_process.get());
-        self.next_process.set(id.get() + 1);
-        let process = Process {
+        let mut processes = self.processes.borrow_mut();
+        let id = ProcessId::new(u32::try_from(processes.len()).expect("too many processes"));
+        processes.push(Process {
             label,
             machine,
             boot,
-        };
-        self.processes.borrow_mut().insert(id, process);
+        });
         id
     }
 
