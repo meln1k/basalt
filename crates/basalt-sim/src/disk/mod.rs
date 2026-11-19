@@ -331,8 +331,8 @@ impl DiskIo for SimDisk {
             let store = self.start(false).await?;
             let existing = {
                 let state = store.state.borrow();
-                state.live.check_parents(path)?;
-                match state.live.entry(path) {
+                state.live().check_parents(path)?;
+                match state.live().entry(path) {
                     Entry::Dir | Entry::File(_) if opts.create_new => {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
@@ -365,8 +365,7 @@ impl DiskIo for SimDisk {
                     }
                     let inode = Rc::new(RefCell::new(Inode::new(store.usage.clone())));
                     let mut state = store.state.borrow_mut();
-                    state.live.create_parents(path);
-                    state.live.files.insert(path.to_owned(), inode.clone());
+                    state.insert_file(path, inode.clone());
                     inode
                 }
             };
@@ -389,7 +388,7 @@ impl DiskIo for SimDisk {
             check_path(to)?;
             let store = self.start(false).await?;
             let mut state = store.state.borrow_mut();
-            let live = &mut state.live;
+            let live = state.live();
             live.check_parents(from)?;
             let inode = match live.entry(from) {
                 Entry::Missing => return Err(not_found(from)),
@@ -401,9 +400,8 @@ impl DiskIo for SimDisk {
                 return Err(is_a_directory(to));
             }
             if from != to {
-                live.create_parents(to);
-                live.files.remove(from);
-                live.files.insert(to.to_owned(), inode);
+                state.remove_file(from);
+                state.insert_file(to, inode);
             }
             Ok(())
         })
@@ -414,13 +412,12 @@ impl DiskIo for SimDisk {
             check_path(path)?;
             let store = self.start(false).await?;
             let mut state = store.state.borrow_mut();
-            let live = &mut state.live;
-            live.check_parents(path)?;
-            match live.entry(path) {
+            state.live().check_parents(path)?;
+            match state.live().entry(path) {
                 Entry::Missing => Err(not_found(path)),
                 Entry::Dir => Err(is_a_directory(path)),
                 Entry::File(_) => {
-                    live.files.remove(path);
+                    state.remove_file(path);
                     Ok(())
                 }
             }
@@ -432,7 +429,7 @@ impl DiskIo for SimDisk {
             check_dir(dir)?;
             let store = self.start(false).await?;
             let state = store.state.borrow();
-            let live = &state.live;
+            let live = state.live();
             live.check_parents(dir)?;
             if let Entry::File(_) = live.entry(dir) {
                 return Err(not_a_directory(dir));
@@ -450,8 +447,8 @@ impl DiskIo for SimDisk {
             check_dir(dir)?;
             let store = self.start(true).await?;
             let mut state = store.state.borrow_mut();
-            state.live.check_parents(dir)?;
-            match state.live.entry(dir) {
+            state.live().check_parents(dir)?;
+            match state.live().entry(dir) {
                 Entry::File(_) => Err(not_a_directory(dir)),
                 // Nothing in a missing directory can be lost.
                 Entry::Missing => Ok(()),

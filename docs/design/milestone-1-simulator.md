@@ -1,6 +1,6 @@
 # Milestone 1: simulator design
 
-Status: draft. Last updated 2026-11-14.
+Status: built (T1–T15 of the milestone 1 plan). The acceptance run on 2026-11-19 met every check under "What done means" except one: 10,000 seeds passed with both bugs off, not yet 100,000. A 60-second register test takes 0.69 seconds of wall time on average in a sweep, under the 1-second target, though about 1 seed in 10 takes 1 to 1.2 seconds. Last updated 2026-11-19.
 
 Milestone 1 builds a FoundationDB-style simulator in Rust. All of Basalt's code runs as plain Rust futures on our own single-threaded executor, built on `async-task`, and reaches time, randomness, network, and disks only through one context type, `Ctx`, passed explicitly. Diagnostics (`buggify!`, `probe!`, `trace!`, and knobs) are ambient, because they never depend on which process is acting. In tests, a simulated world implements `Ctx`. In production, a thin real-I/O backend implements it. We prove the simulator by finding two planted bugs in a toy replicated register and replaying each failure exactly from its seed. The shipped `basalt` binary includes the simulator from day one, so `basalt sim` runs against the exact build that gets deployed.
 
@@ -246,16 +246,16 @@ The demo: a sweep with a bug on finds a failing seed, `run --seed N` replays the
 
 ## Steps
 
-- [ ] Cargo workspace, `basalt-env` types, lints, and `cargo-deny` setup
-- [ ] `basalt` binary with `server` and `sim` subcommands, `panic = "abort"`, and the seed-printing panic hook
-- [ ] Simulator executor: virtual time, PRNG, processes, kill and reboot on `async-task`
-- [ ] Harness: test specs, runner, sweep, unseed check, traces
-- [ ] Simulated network with latency, clogging, partitions, and resets
-- [ ] Simulated disk with pending writes, power-cut corruption, full disk, and I/O errors
-- [ ] `buggify!`, randomized knobs, probes, and swarm configs
-- [ ] Linearizability and durability checkers
-- [ ] ABD register, workloads, and both planted bugs
-- [ ] Minimal `basalt-rt` and a smoke test running the register as 3 real processes on localhost
+- [x] Cargo workspace, `basalt-env` types, lints, and `cargo-deny` setup
+- [x] `basalt` binary with `server` and `sim` subcommands, `panic = "abort"`, and the seed-printing panic hook
+- [x] Simulator executor: virtual time, PRNG, processes, kill and reboot on `async-task`
+- [x] Harness: test specs, runner, sweep, unseed check, traces
+- [x] Simulated network with latency, clogging, partitions, and resets
+- [x] Simulated disk with pending writes, power-cut corruption, full disk, and I/O errors
+- [x] `buggify!`, randomized knobs, probes, and swarm configs
+- [x] Linearizability and durability checkers
+- [x] ABD register, workloads, and both planted bugs
+- [x] Minimal `basalt-rt` and a smoke test running the register as 3 real processes on localhost
 
 ## What done means
 
@@ -286,7 +286,7 @@ The demo: a sweep with a bug on finds a failing seed, `run --seed N` replays the
 ## Risks
 
 - **A dependency hides nondeterminism.** For example, rustls draws nonces from `getrandom`; we'll inject our PRNG through its crypto provider when TLS arrives. Earliest signal: an unseed mismatch.
-- **Code assumes work after an `.await` always completes.** Cancellation by drop breaks that assumption when a process is killed. Earliest signal: invariant failures right after kills. Mitigation: a coding guide plus a `buggify!` that cancels tasks at random.
+- **Code assumes work after an `.await` always completes.** Cancellation by drop breaks that assumption when a process is killed. Earliest signal: invariant failures right after kills. Mitigation: a coding guide ([Cancellation safety](../guides/cancellation-safety.md)) plus a `buggify!` that cancels tasks at random.
 - **Byte-stream simulation is too slow for large sweeps.** Earliest signal: the 60-second register test takes more than 1 second. Mitigation: coalesce chunks on the fast path.
 - **The disk model misses a real filesystem behavior.** Earliest signal: a bug in the field that simulation can't reproduce. Mitigation: keep the model weaker than real filesystems, and add behaviors as we learn them.
 - **Process-scoped behavior creeps into the ambient API.** For example, someone adds an ambient `spawn` for convenience. Earliest signal: a change to the ambient section of `basalt-env`, which code review should treat as a design change.
