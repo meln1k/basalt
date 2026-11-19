@@ -19,8 +19,13 @@ pub(super) type InodeRef = Rc<RefCell<Inode>>;
 /// What processes see, and what survives a power cut.
 #[derive(Default)]
 pub(super) struct State {
+    /// Change its files only through [`State::insert_file`] and [`State::remove_file`], which
+    /// keep `pending`.
     pub(super) live: Tree,
     durable: Tree,
+    /// The file paths whose live entry may differ from their durable one. Every other path has
+    /// the same entry, or none, in both trees.
+    pending: BTreeSet<String>,
 }
 
 /// A disk's names: its directories and the files in them. The root `""` is always a directory
@@ -73,11 +78,7 @@ impl Tree {
         &'a self,
         dir: &'a str,
     ) -> impl Iterator<Item = (&'a str, &'a InodeRef)> + 'a {
-        let prefix = if dir.is_empty() {
-            String::new()
-        } else {
-            format!("{dir}/")
-        };
+        let prefix = prefix(dir);
         let skip = prefix.len();
         self.files
             .range(prefix.clone()..)
@@ -111,19 +112,37 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
 }
 
-fn join(dir: &str, name: &str) -> String {
+/// What every path directly in `dir` starts with.
+fn prefix(dir: &str) -> String {
     if dir.is_empty() {
-        name.to_owned()
+        String::new()
     } else {
-        format!("{dir}/{name}")
+        format!("{dir}/")
     }
 }
 
 impl State {
+    /// Gives the live file at `path` the contents `inode`, creating the directories above it.
+    pub(super) fn insert_file(&mut self, path: &str, inode: InodeRef) {
+        self.live.create_parents(path);
+        self.live.files.insert(path.to_owned(), inode);
+        self.pending.insert(path.to_owned());
+    }
+
+    /// Removes the live file at `path`.
+    pub(super) fn remove_file(&mut self, path: &str) {
+        self.live.files.remove(path);
+        self.pending.insert(path.to_owned());
+    }
+
     /// Makes durable the files directly in `dir` and every directory on the path to it, as
     /// `sync_dir` does. `dir` must be a live directory.
     pub(super) fn sync_dir(&mut self, dir: &str) {
-        let State { live, durable } = self;
+        let State {
+            live,
+            durable,
+            pending,
+        } = self;
         if !dir.is_empty() {
             for d in parents(dir).chain([dir]) {
                 // Its name in its parent is now a directory, whatever it was before.
@@ -131,15 +150,21 @@ impl State {
                 durable.dirs.insert(d.to_owned());
             }
         }
-        let stale: Vec<String> = durable
-            .files_in(dir)
-            .map(|(name, _)| join(dir, name))
+        // Only the pending names in `dir` can differ, so a directory with many files costs only
+        // what changed in it since its last sync.
+        let prefix = prefix(dir);
+        let synced: Vec<String> = pending
+            .range(prefix.clone()..)
+            .take_while(|path| path.starts_with(&prefix))
+            .filter(|path| !path[prefix.len()..].contains('/'))
+            .cloned()
             .collect();
-        for path in stale {
-            durable.files.remove(&path);
-        }
-        for (name, inode) in live.files_in(dir) {
-            durable.files.insert(join(dir, name), inode.clone());
+        for path in synced {
+            match live.files.get(&path) {
+                Some(inode) => durable.files.insert(path.clone(), inode.clone()),
+                None => durable.files.remove(&path),
+            };
+            pending.remove(&path);
         }
     }
 
@@ -209,5 +234,6 @@ impl State {
             }
         }
         self.live = self.durable.clone();
+        self.pending.clear();
     }
 }
