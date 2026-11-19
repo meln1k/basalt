@@ -377,6 +377,8 @@ fn io_errors_and_bit_flips_until_restored() {
         assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
         let (result, _) = file.write_at(vec![0; 10], 0).await;
         assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(file.sync().await.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(disk.sync_dir("").await.unwrap_err().raw_os_error(), Some(5));
     });
     node.ctrl.restore_disks();
     let o = original.clone();
@@ -391,6 +393,56 @@ fn io_errors_and_bit_flips_until_restored() {
     });
     node.ctrl.restore_disks();
     node.run(|disk| async move { assert_eq!(contents(&disk, "a").await.unwrap(), original) });
+}
+
+/// A sync or `sync_dir` that fails with `EIO` makes nothing durable, so a power cut may still
+/// lose the data and the name. A failed `sync` may also lose the pages outright, as on Linux:
+/// reads still see them, but even a later sync that succeeds doesn't make them durable.
+#[test]
+fn a_failed_sync_leaves_data_pending_or_loses_it() {
+    let written = data(10_000, 7);
+    let (mut lost, mut kept_after_retry, mut lost_after_retry) = (0, 0, 0);
+    for seed in 0..40 {
+        for retry in [false, true] {
+            let node = Node::new(seed);
+            let id = node.ctx().disks()[0];
+            let w = written.clone();
+            node.run(|disk| async move { write(&disk, "d/a", &w, false).await });
+            node.ctrl.set_disk_errors(id, 1.0);
+            node.run(|disk| async move {
+                let file = disk.open("d/a", create()).await.unwrap();
+                assert_eq!(file.sync().await.unwrap_err().raw_os_error(), Some(5));
+                assert_eq!(
+                    disk.sync_dir("d").await.unwrap_err().raw_os_error(),
+                    Some(5)
+                );
+            });
+            node.ctrl.restore_disks();
+            let w = written.clone();
+            node.run(move |disk| async move {
+                assert_eq!(contents(&disk, "d/a").await, Some(w), "reads see the pages");
+                if retry {
+                    let file = disk.open("d/a", create()).await.unwrap();
+                    file.sync().await.unwrap();
+                    disk.sync_dir("d").await.unwrap();
+                }
+            });
+            node.restart(KillType::PowerCut);
+            let a = node.run(|disk| async move { contents(&disk, "d/a").await });
+            if !retry {
+                lost += u32::from(a.as_ref() != Some(&written));
+            } else if a.as_ref() == Some(&written) {
+                kept_after_retry += 1;
+            } else {
+                // The retry made the name and the length durable, but not the lost pages.
+                assert_eq!(a, Some(vec![0; 10_000]), "seed {seed}");
+                lost_after_retry += 1;
+            }
+        }
+    }
+    assert!(lost > 0, "a power cut never lost what a failed sync left");
+    assert!(kept_after_retry > 0, "a retried sync never saved the data");
+    assert!(lost_after_retry > 0, "a failed sync never lost the pages");
 }
 
 #[test]

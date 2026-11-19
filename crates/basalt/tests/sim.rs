@@ -297,7 +297,7 @@ fn skip_writeback_is_caught_by_the_linearizability_checker() {
 fn ack_before_sync_is_caught_by_the_durability_checker() {
     planted_bug_demo(
         "register-ack-before-sync",
-        117,
+        150,
         &["durability violation on key", "losing acknowledged writes"],
     );
 }

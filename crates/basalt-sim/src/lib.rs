@@ -272,9 +272,12 @@ impl SimControl {
         self.world.disks.fill(disk);
     }
 
-    /// Makes each read and write on `disk` fail with `EIO` with probability `p`, until
-    /// [`restore_disks`](SimControl::restore_disks). A failed write changes nothing. Panics if
-    /// no machine has `disk`, or unless `0 <= p <= 1`.
+    /// Makes each read, write, `sync`, and `sync_dir` on `disk` fail with `EIO` with
+    /// probability `p`, until [`restore_disks`](SimControl::restore_disks). A failed write
+    /// changes nothing. A failed sync leaves what it would have made durable pending, and half
+    /// the time a failed `sync` loses the file's pending pages, as Linux may: reads still see
+    /// them, but a later `sync` doesn't make them durable, so a power cut reverts them.
+    /// Panics if no machine has `disk`, or unless `0 <= p <= 1`.
     pub fn set_disk_errors(&self, disk: DiskId, p: f64) {
         self.world.disks.set_io_errors(disk, p);
     }

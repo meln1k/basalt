@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use basalt_env::backend::{DiskIo, FileIo, LocalBoxFuture, check_dir, check_path};
-use basalt_env::{DiskId, Duration, Instant, OpenOptions, ProcessId, Rng, Space};
+use basalt_env::{DiskId, Duration, Instant, OpenOptions, ProcessId, Rng, Space, probe};
 
 use crate::machine::Machines;
 use crate::time::{Clock, Sleep};
@@ -55,6 +55,10 @@ const FLUSH_TIME: Duration = Duration::from_micros(500);
 const STALL_PROBABILITY: f64 = 0.001;
 const MIN_STALL: Duration = Duration::from_millis(5);
 const MAX_STALL: Duration = Duration::from_millis(50);
+
+/// How often a failed `sync` also loses the file's pending pages, as Linux does when writeback
+/// fails: it marks them clean, so a later `sync` succeeds without writing them.
+const SYNC_LOSES_PAGES_PROBABILITY: f64 = 0.5;
 
 /// How often the disk finishes an operation of a process that died while the operation was in
 /// flight, before the process died.
@@ -131,7 +135,7 @@ impl Disks {
         self.store(disk).faults.borrow_mut().full = true;
     }
 
-    /// Makes reads and writes on `disk` fail with `EIO` with probability `p`.
+    /// Makes reads, writes, and syncs on `disk` fail with `EIO` with probability `p`.
     pub(crate) fn set_io_errors(&self, disk: DiskId, p: f64) {
         check_probability(p);
         self.store(disk).faults.borrow_mut().io_errors = p;
@@ -208,7 +212,7 @@ struct Store {
 #[derive(Default)]
 struct Faults {
     full: bool,
-    /// The probability that a read or write fails with `EIO`.
+    /// The probability that a read, write, `sync`, or `sync_dir` fails with `EIO`.
     io_errors: f64,
     /// The probability that a read returns one flipped bit.
     bit_flips: f64,
@@ -521,6 +525,11 @@ impl DiskIo for SimDisk {
             return failed(Err(e));
         }
         self.submit(true, move |store| {
+            // A failed sync leaves the entries pending, for a power cut to lose.
+            if let Err(e) = self.handle.disks.io_error(&store) {
+                probe!("disk.sync_dir_failed");
+                return Err(e);
+            }
             let mut state = store.state.borrow_mut();
             state.live().check_parents(dir)?;
             match state.live().entry(dir) {
@@ -641,6 +650,16 @@ impl FileIo for SimFile {
         let handle = &self.handle;
         Box::pin(handle.submit(&self.store, 0, true, move || {
             handle.complete(|| {
+                // A failed sync leaves the pages pending, for a power cut to lose or corrupt, or
+                // loses them outright, as Linux may.
+                if let Err(e) = handle.disks.io_error(&self.store) {
+                    probe!("disk.sync_failed");
+                    if handle.disks.rng.bool(SYNC_LOSES_PAGES_PROBABILITY) {
+                        probe!("disk.sync_lost_pages");
+                        self.inode.borrow_mut().lose_dirty();
+                    }
+                    return Err(e);
+                }
                 self.inode.borrow_mut().sync();
                 Ok(())
             })
