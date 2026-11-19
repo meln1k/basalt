@@ -91,10 +91,13 @@ impl DiskIo for Disk {
         let to = self.file(to);
         self.run(self.file(from), move |from| {
             let to = to?;
-            for path in [&from, &to] {
-                if path.is_dir() {
-                    return Err(is_a_directory(path));
-                }
+            // Check both names before creating the directories above `to`, so a failed rename
+            // leaves nothing behind.
+            if fs::symlink_metadata(&from)?.is_dir() {
+                return Err(is_a_directory(&from));
+            }
+            if to.is_dir() {
+                return Err(is_a_directory(&to));
             }
             create_parents(&to)?;
             fs::rename(from, to)
